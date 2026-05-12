@@ -41,5 +41,8 @@
     <ClInclude Include="ssl_core.h" />
     <ClInclude Include="ssl_keyfmt.h" />
   </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="SSLClaw.rc" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
