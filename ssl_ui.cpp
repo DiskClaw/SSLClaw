@@ -1,6 +1,8 @@
 // ssl_ui.cpp - SSL 证书工具 UI 实现
 #include "ssl_ui.h"
 #include "ssl_core.h"
+#include <commctrl.h>
+#pragma comment(lib, "comctl32.lib")
 #include <iphlpapi.h>
 #pragma comment(lib, "iphlpapi.lib")
 #include <shlobj.h>
@@ -514,6 +516,27 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
         }
         break;
+    }
+    case WM_SYSCOMMAND: {
+        if ((w & 0xFFF0) == SC_CONTEXTHELP) {
+            auto cb = [](HWND hw, UINT nm, WPARAM wp, LPARAM lp, LONG_PTR ref) -> HRESULT {
+                if (nm == TDN_HYPERLINK_CLICKED)
+                    ShellExecuteW((HWND)hw, L"open", (LPCWSTR)lp, NULL, NULL, SW_SHOWNORMAL);
+                return S_OK;
+            };
+            TASKDIALOGCONFIG tc = {0};
+            tc.cbSize = sizeof(tc);
+            tc.hwndParent = h;
+            tc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_ENABLE_HYPERLINKS;
+            tc.pszWindowTitle = L"关于 SSLClaw";
+            tc.pszMainIcon = TD_INFORMATION_ICON;
+            tc.pszMainInstruction = L"SSLClaw v1.0";
+            tc.pszContent = L"Windows SSL 证书申请工具\n基于 ACME 协议自动申请 Let's Encrypt 证书\n\n作者：DiskClaw\n<a href=\"https://github.com/DiskClaw/SSLClaw\">https://github.com/DiskClaw/SSLClaw</a>";
+            tc.pfCallback = cb;
+            TaskDialogIndirect(&tc, NULL, NULL, NULL);
+            return 0;
+        }
+        return DefWindowProcW(h, m, w, l);
     }
     case WM_TIMER: {
         if (w == IP_TIMER_ID && g_ipList.size() > 1) {

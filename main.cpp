@@ -32,8 +32,8 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     RegisterClassExW(&wc);
 
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-    g_hWnd = CreateWindowExW(0, L"S", L"SSLClaw 证书申请工具",
-        WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
+    g_hWnd = CreateWindowExW(WS_EX_CONTEXTHELP, L"S", L"SSLClaw 证书申请工具",
+        WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX & ~WS_THICKFRAME,
         (sw - 480) / 2, max(0, (sh - 560) / 2), 480, 560, 0, 0, hInstance, 0);
 
     ShowWindow(g_hWnd, nCmdShow);
