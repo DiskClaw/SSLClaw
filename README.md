@@ -1,6 +1,7 @@
 # SSLClaw
 
 Windows SSL 证书申请工具，基于 ACME 协议自动申请 Let's Encrypt 免费证书。
+<img width="590" height="690" alt="ScreenShot_2026-05-12_151858_435" src="https://github.com/user-attachments/assets/3a1ea4c6-e0b9-4dd2-81a9-2983baa571f7" />
 
 ## 功能
 
