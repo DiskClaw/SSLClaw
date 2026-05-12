@@ -1,0 +1,23 @@
+# Build artifacts
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.tmp
+*.pfx
+
+# VS cache
+.vs/
+x64/
+Debug/
+Release/
+
+# Runtime
+sslclaw.ini
+*.crt
+*.key
+
+# Workbuddy
+.workbuddy/

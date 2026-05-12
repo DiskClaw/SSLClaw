@@ -1,0 +1,50 @@
+// ssl_ui.h - SSL 证书工具 UI
+#pragma once
+
+#include <winsock2.h>
+#include <windows.h>
+#include <string>
+#include <vector>
+
+// UI 控件句柄
+extern HWND g_hWnd;
+extern HWND g_hDomain;
+extern HWND g_hEmail;
+extern HWND g_hBtnApply;
+extern HWND g_hLog;
+extern HWND g_hStatus;
+extern HWND g_hSaveDirEdit;
+extern HWND g_hBtnBrowse;
+extern HWND g_hBtnOpen;
+extern HWND g_hDaysEdit;
+extern HWND g_hServer;
+extern HWND g_hIP;
+extern HWND g_hVerifyMode;
+extern HWND g_hWebRoot;
+extern HWND g_hBtnWebRootBrowse;
+extern HWND g_hBtnWebRootOpen;
+extern HWND g_hCA;
+extern HWND g_hCAInd;  // CA 连接指示灯
+extern HWND g_hCAStatus; // CA 状态文字
+extern HWND g_hWildcard;  // 通配符复选框（DNS-01 专用）
+
+// CA 指示灯状态
+extern int g_caStatus;
+
+// IP 轮播
+extern std::vector<std::wstring> g_ipList;
+extern int g_ipIndex;
+
+// 全局状态
+extern std::wstring g_SaveDir;
+extern std::wstring g_IniPath;
+
+// 回调函数
+void Log(const wchar_t* fmt, ...);
+void SetStatus(const wchar_t* t);
+
+// UI 函数
+void BrowseDir();
+void SyncWebRootVis();
+void ShowVerifySteps(int vm);
+LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l);
