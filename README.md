@@ -1,5 +1,6 @@
 # 软件如图：
 <img width="590" height="690" alt="ScreenShot_2026-05-12_151858_435" src="https://github.com/user-attachments/assets/3a1ea4c6-e0b9-4dd2-81a9-2983baa571f7" />
+<img width="589" height="688" alt="ScreenShot_2026-05-13_153521_719" src="https://github.com/user-attachments/assets/d1070bed-c0b0-4c79-ab84-f12ff645e920" />
 
 # SSLClaw
 
