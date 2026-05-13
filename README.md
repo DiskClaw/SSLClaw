@@ -1,10 +1,12 @@
 # 软件如图：
+## http-01 成功界面
 <img width="590" height="690" alt="ScreenShot_2026-05-12_151858_435" src="https://github.com/user-attachments/assets/3a1ea4c6-e0b9-4dd2-81a9-2983baa571f7" />
+## dns-01 成功界面
 <img width="589" height="688" alt="ScreenShot_2026-05-13_153521_719" src="https://github.com/user-attachments/assets/d1070bed-c0b0-4c79-ab84-f12ff645e920" />
 
 # SSLClaw
 
-Windows SSL 证书申请工具，基于 ACME 协议自动申请 Let's Encrypt 免费SSL证书。
+Windows SSL 证书申请工具，基于 ACME 协议自动申请 Let's Encrypt 免费SSL证书。点击就自动下载。彻底解放小白！！
 
 ## 功能
 
