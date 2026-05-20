@@ -5,6 +5,9 @@
 ## dns-01 成功界面
 <img width="589" height="688" alt="ScreenShot_2026-05-13_153521_719" src="https://github.com/user-attachments/assets/d1070bed-c0b0-4c79-ab84-f12ff645e920" />
 
+### cloudflare和阿里云 api自动申请成功界面
+<img width="599" height="690" alt="ScreenShot_2026-05-20_140351_678" src="https://github.com/user-attachments/assets/28d890c2-8f6e-44ad-ab23-1a7d6695fb46" />
+
 # SSLClaw
 
 Windows SSL 证书管理工具，基于 ACME 协议自动申请和续签 Let's Encrypt 免费证书。
