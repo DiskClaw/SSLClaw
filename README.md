@@ -2,7 +2,7 @@
 ## http-01 成功界面
 <img width="590" height="690" alt="ScreenShot_2026-05-12_151858_435" src="https://github.com/user-attachments/assets/3a1ea4c6-e0b9-4dd2-81a9-2983baa571f7" />
 
-## cloudflare和阿里云 api自动申请成功界面 （可手工txt和自动api注册）
+## cloudflare和阿里云 api自动申请成功界面 （可手工txt和自动api  可2种dns-01方式注册）
 <img width="599" height="690" alt="ScreenShot_2026-05-20_140351_678" src="https://github.com/user-attachments/assets/28d890c2-8f6e-44ad-ab23-1a7d6695fb46" />
 
 # SSLClaw
