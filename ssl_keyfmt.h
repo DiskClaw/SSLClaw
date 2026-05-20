@@ -9,6 +9,9 @@
 // BCRYPT_RSAFULLPRIVATE_BLOB → PKCS#8 PEM（BEGIN PRIVATE KEY）
 std::string RsaFullBlobToPkcs8Pem(const std::vector<BYTE>& blob);
 
+// BCRYPT_RSAFULLPRIVATE_BLOB → PKCS#8 原始 DER
+std::vector<BYTE> RsaFullBlobToPkcs8Der(const std::vector<BYTE>& blob);
+
 // BCRYPT_RSAFULLPRIVATE_BLOB → PKCS#1 PEM（BEGIN RSA PRIVATE KEY）
 std::string RsaFullBlobToPkcs1Pem(const std::vector<BYTE>& blob);
 

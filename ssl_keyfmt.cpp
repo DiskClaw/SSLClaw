@@ -88,7 +88,7 @@ static bool ParseRsaFullBlob(const std::vector<BYTE>& blob, RsaFullFields& f) {
     if (blob.size() < sizeof(BCRYPT_RSAKEY_BLOB)) return false;
     BCRYPT_RSAKEY_BLOB* hdr = (BCRYPT_RSAKEY_BLOB*)blob.data();
     // 检查 Magic
-    if (hdr->Magic != 0x33415352) return false; // BCRYPT_RSAFULLPRIVATE_MAGIC
+    if (hdr->Magic != BCRYPT_RSAFULLPRIVATE_MAGIC) return false;
 
     const BYTE* p = blob.data() + sizeof(BCRYPT_RSAKEY_BLOB);
     f.cbPubExp  = hdr->cbPublicExp;
@@ -189,6 +189,51 @@ std::string RsaFullBlobToPkcs8Pem(const std::vector<BYTE>& blob) {
     return "-----BEGIN PRIVATE KEY-----\r\n" + bp + "\r\n-----END PRIVATE KEY-----\r\n";
 }
 
+std::vector<BYTE> RsaFullBlobToPkcs8Der(const std::vector<BYTE>& blob) {
+    RsaFullFields f;
+    if (!ParseRsaFullBlob(blob, f)) return {};
+
+    BYTE ver0 = 0;
+    auto pkcs1Der = DerSequence({
+        DerInteger(&ver0, 1),
+        DerInteger(f.modulus, f.cbModulus),
+        DerInteger(f.pubExp, f.cbPubExp),
+        DerInteger(f.privExp, f.cbModulus),
+        DerInteger(f.prime1, f.cbPrime1),
+        DerInteger(f.prime2, f.cbPrime2),
+        DerInteger(f.exponent1, f.cbPrime1),
+        DerInteger(f.exponent2, f.cbPrime2),
+        DerInteger(f.coefficient, f.cbPrime1)
+    });
+
+    static const BYTE rsaAlgId[] = {
+        0x30, 0x0D,
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D,
+        0x01, 0x01, 0x01,
+        0x05, 0x00
+    };
+    static const BYTE pkcs8Ver[] = { 0x02, 0x01, 0x00 };
+
+    BYTE octHdr[4];
+    octHdr[0] = 0x04;
+    int ohl = DerLenEncode(pkcs1Der.size(), octHdr + 1);
+    std::vector<BYTE> octStr;
+    octStr.insert(octStr.end(), octHdr, octHdr + 1 + ohl);
+    octStr.insert(octStr.end(), pkcs1Der.begin(), pkcs1Der.end());
+
+    size_t innerLen = sizeof(pkcs8Ver) + sizeof(rsaAlgId) + octStr.size();
+    std::vector<BYTE> pkcs8Der;
+    BYTE seqHdr[4];
+    seqHdr[0] = 0x30;
+    int shl = DerLenEncode(innerLen, seqHdr + 1);
+    pkcs8Der.reserve(1 + shl + innerLen);
+    pkcs8Der.insert(pkcs8Der.end(), seqHdr, seqHdr + 1 + shl);
+    pkcs8Der.insert(pkcs8Der.end(), pkcs8Ver, pkcs8Ver + sizeof(pkcs8Ver));
+    pkcs8Der.insert(pkcs8Der.end(), rsaAlgId, rsaAlgId + sizeof(rsaAlgId));
+    pkcs8Der.insert(pkcs8Der.end(), octStr.begin(), octStr.end());
+    return pkcs8Der;
+}
+
 // PKCS#8 PEM → PKCS#1 PEM
 // 方案: 微软官方 CryptDecodeObjectEx 两步解码法
 //   第一步: CryptDecodeObjectEx(PKCS_PRIVATE_KEY_INFO) 剥 PKCS#8 外壳
@@ -206,9 +251,13 @@ std::string Pkcs8PemToPkcs1Pem(const std::string& pkcs8Pem) {
         if (pkcs8Pem[i] == '\n' || pkcs8Pem[i] == '\r' || pkcs8Pem[i] == ' ') continue;
         b64 += pkcs8Pem[i];
     }
+    if (b64.empty()) return ""; // 安全检查
+    
     DWORD cbDer = 0;
     if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, NULL, &cbDer, NULL, NULL))
         return "";
+    if (cbDer == 0) return ""; // 安全检查
+    
     std::vector<BYTE> der(cbDer);
     if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, der.data(), &cbDer, NULL, NULL))
         return "";
@@ -222,7 +271,12 @@ std::string Pkcs8PemToPkcs1Pem(const std::string& pkcs8Pem) {
         return "";
 
     // 第二步: 内层 PrivateKey.pbData 就是 PKCS#1 DER
-    std::string bp = B64Pem(std::vector<BYTE>(pInfo->PrivateKey.pbData, pInfo->PrivateKey.pbData + pInfo->PrivateKey.cbData));
+    // 安全检查
+    std::string result;
+    if (pInfo && pInfo->PrivateKey.pbData && pInfo->PrivateKey.cbData > 0) {
+        std::string bp = B64Pem(std::vector<BYTE>(pInfo->PrivateKey.pbData, pInfo->PrivateKey.pbData + pInfo->PrivateKey.cbData));
+        result = "-----BEGIN RSA PRIVATE KEY-----\r\n" + bp + "\r\n-----END RSA PRIVATE KEY-----\r\n";
+    }
     LocalFree(pInfo);
-    return "-----BEGIN RSA PRIVATE KEY-----\r\n" + bp + "\r\n-----END RSA PRIVATE KEY-----\r\n";
+    return result;
 }

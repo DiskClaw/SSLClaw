@@ -6,19 +6,102 @@
 
 #pragma warning(suppress:28251) // WinMain 批注与 SDK 声明不一致，已知问题
 int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPSTR lpCmdLine, _In_ int nCmdShow) {
+    // 检测命令行续签模式
+    {
+        int argc; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        bool renewMode = false;
+        for (int i = 1; i < argc; i++) {
+            if (wcscmp(argv[i], L"--renew") == 0) {
+                renewMode = true; break;
+            }
+        }
+        LocalFree(argv);
+        if (renewMode) {
+            HRESULT hr2 = CoInitializeEx(0, COINIT_APARTMENTTHREADED);
+            WSADATA wd2; WSAStartup(MAKEWORD(2, 2), &wd2);
+            int ret = RunRenewalMode();
+            WSACleanup();
+            if (SUCCEEDED(hr2)) CoUninitialize();
+            return ret;
+        }
+    }
+
     HRESULT hr = CoInitializeEx(0, COINIT_APARTMENTTHREADED);
+    bool comInitialized = SUCCEEDED(hr);
     if (FAILED(hr)) {
         MessageBoxW(NULL, L"COM 初始化失败，部分功能可能异常", L"SSLClaw", MB_ICONWARNING);
     }
     WSADATA wd; if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) {
         MessageBoxW(NULL, L"网络初始化失败，无法运行", L"SSLClaw", MB_ICONERROR);
-        CoUninitialize(); return 1;
+        if (comInitialized) CoUninitialize();
+        return 1;
     }
 
     // ini 放 exe 同目录
     wchar_t exePath[MAX_PATH]; GetModuleFileNameW(NULL, exePath, MAX_PATH);
     wchar_t* slash = wcsrchr(exePath, L'\\');
     if (slash) { slash[1] = 0; g_IniPath = exePath; g_IniPath += L"sslclaw.ini"; }
+
+    // 日志文件放 exe 同目录
+    extern std::wstring g_LogFilePath;
+    g_LogFilePath = exePath; g_LogFilePath += L"sslclaw.log";
+
+    // 先确保 sslclaw.ini 是 UTF-16 LE BOM，再进行任何 INI 操作
+    EnsureIniUtf16(g_IniPath.c_str());
+
+    // 迁移旧 INI 文件到统一 sslclaw.ini
+    {
+        std::wstring exeDir = exePath;
+        // 迁移续签记录: <exename>_renewals.ini → sslclaw.ini
+        {
+            std::wstring oldExe = exePath;
+            size_t dot = oldExe.rfind(L'.');
+            std::wstring oldRenewalIni = (dot != std::wstring::npos) ? oldExe.substr(0, dot) + L"_renewals.ini" : oldExe + L"_renewals.ini";
+            if (PathFileExistsW(oldRenewalIni.c_str())) {
+                EnsureIniUtf16(oldRenewalIni.c_str());
+                wchar_t secBuf[32768];
+                DWORD secLen = GetPrivateProfileSectionNamesW(secBuf, 32768, oldRenewalIni.c_str());
+                const wchar_t* p = secBuf;
+                while (*p && p < secBuf + secLen) {
+                    std::wstring sec(p);
+                    if (sec.find(L"Renewal:") == 0) {
+                        wchar_t keyBuf[32768];
+                        DWORD keyLen = GetPrivateProfileSectionW(sec.c_str(), keyBuf, 32768, oldRenewalIni.c_str());
+                        const wchar_t* k = keyBuf;
+                        while (*k && k < keyBuf + keyLen) {
+                            std::wstring kv(k);
+                            size_t eq = kv.find(L'=');
+                            if (eq != std::wstring::npos) {
+                                std::wstring key = kv.substr(0, eq);
+                                std::wstring val = kv.substr(eq + 1);
+                                WritePrivateProfileStringW(sec.c_str(), key.c_str(), val.c_str(), g_IniPath.c_str());
+                            }
+                            k += wcslen(k) + 1;
+                        }
+                    }
+                    p += wcslen(p) + 1;
+                }
+                DeleteFileW(oldRenewalIni.c_str());
+            }
+        }
+        // 迁移 SMTP 通知配置: settings.ini → sslclaw.ini [Notification]
+        {
+            std::wstring oldSettingsIni = exeDir + L"settings.ini";
+            if (PathFileExistsW(oldSettingsIni.c_str())) {
+                EnsureIniUtf16(oldSettingsIni.c_str());
+                const wchar_t* keys[] = { L"SmtpServer", L"SmtpPort", L"SmtpUser", L"SmtpPass", L"SmtpFrom", L"SmtpTo" };
+                bool hasAny = false;
+                for (auto key : keys) {
+                    wchar_t buf[4096];
+                    if (GetPrivateProfileStringW(L"Notification", key, L"", buf, 4096, oldSettingsIni.c_str()) && buf[0]) {
+                        WritePrivateProfileStringW(L"Notification", key, buf, g_IniPath.c_str());
+                        hasAny = true;
+                    }
+                }
+                if (hasAny) DeleteFileW(oldSettingsIni.c_str());
+            }
+        }
+    }
 
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -38,6 +121,9 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
 
     ShowWindow(g_hWnd, nCmdShow);
     UpdateWindow(g_hWnd);
+
+    // 注册任务栏重建消息（Explorer 崩溃后托盘图标恢复用）
+    WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
 
     // 检测管理员状态并更新标题
     {
@@ -70,6 +156,13 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
         // 恢复通配符复选框
         int wc = GetPrivateProfileIntW(L"SSLClaw", L"Wildcard", 0, g_IniPath.c_str());
         SendMessageW(g_hWildcard, BM_SETCHECK, wc ? BST_CHECKED : BST_UNCHECKED, 0);
+        // 加载 DNS API 配置（按当前域名加载，无域名则加载默认）
+        {
+            wchar_t domainBuf[512];
+            GetWindowTextW(g_hDomain, domainBuf, 512);
+            if (domainBuf[0]) LoadDnsConfigForDomain(domainBuf);
+            else LoadDnsConfig();
+        }
         // CA 固定 Let's Encrypt，忽略 ini 中的旧 CA 设置
         // (ZeroSSL/Buypass 已移除)
     }
@@ -77,8 +170,23 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     // 根据当前验证方式显示步骤提示
     ShowVerifySteps((int)SendMessageW(g_hVerifyMode, CB_GETCURSEL, 0, 0));
 
+    // 迁移旧的 Windows 计划任务到后台线程模式
+    MigrateOldScheduledTask();
+
+    // 如果有自动续签记录，启动后台线程
+    {
+        std::vector<RenewalRecord> records;
+        LoadRenewalRecords(records);
+        bool hasAutoRenew = false;
+        for (auto& r : records) if (r.autoRenew) { hasAutoRenew = true; break; }
+        if (hasAutoRenew) StartRenewalBackgroundThread();
+    }
+
     MSG msg;
     while (GetMessageW(&msg, 0, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+
+    // 停止后台续签线程
+    StopRenewalBackgroundThread();
 
     // 释放全局 ACME 密钥
     if (g_AccKey) { BCryptDestroyKey(g_AccKey); g_AccKey = NULL; }

@@ -27,7 +27,7 @@
     </Link>
     <ClCompile>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -35,6 +35,12 @@
     <ClCompile Include="ssl_ui.cpp" />
     <ClCompile Include="ssl_core.cpp" />
     <ClCompile Include="ssl_keyfmt.cpp" />
+    <ClCompile Include="ssl_utils.cpp" />
+    <ClCompile Include="ssl_http.cpp" />
+    <ClCompile Include="ssl_acme.cpp" />
+    <ClCompile Include="ssl_dnsapi.cpp" />
+    <ClCompile Include="ssl_renewal.cpp" />
+    <ClCompile Include="ssl_deploy.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ssl_ui.h" />

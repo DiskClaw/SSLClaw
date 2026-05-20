@@ -13,11 +13,16 @@
 x64/
 Debug/
 Release/
+SSLClaw/x64/
 
 # Runtime
 sslclaw.ini
 *.crt
 *.key
 
-# Workbuddy
+# Reference source (not part of project)
+win-acme-master/
+
+# IDE
+.trae/
 .workbuddy/

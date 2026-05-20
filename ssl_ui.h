@@ -27,6 +27,7 @@ extern HWND g_hCA;
 extern HWND g_hCAInd;  // CA 连接指示灯
 extern HWND g_hCAStatus; // CA 状态文字
 extern HWND g_hWildcard;  // 通配符复选框（DNS-01 专用）
+extern HWND g_RenewWnd;   // 续签窗口
 
 // CA 指示灯状态
 extern int g_caStatus;
@@ -48,3 +49,15 @@ void BrowseDir();
 void SyncWebRootVis();
 void ShowVerifySteps(int vm);
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l);
+void ShowDnsConfigDialog(HWND hwParent, const std::wstring& overrideDomain = std::wstring());
+
+// DNS API 配置（供 ssl_core.cpp 读取）
+extern int g_DnsProvider;
+extern std::wstring g_DnsApiId;
+extern std::wstring g_DnsApiSecret;
+void LoadDnsConfig();
+void LoadDnsConfigForDomain(const std::wstring& domain);
+void SaveDnsConfigForDomain(const std::wstring& domain);
+
+// 托盘
+extern UINT WM_TASKBARCREATED;
