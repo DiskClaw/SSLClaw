@@ -129,7 +129,7 @@ static unsigned ApplyThreadInner() {
 
     std::wstring nt = wd;
     if (nt.size() >= 2 && nt[0] == L'*' && nt[1] == L'.') nt = L"wildcard." + nt.substr(2);
-    for (wchar_t& c : nt) if (c == L'/' || c == L'\\' || c == L':' || c == L'*' || c == L'?' || c == L'"' || c == L'<' || c == L'>' || c == L'|' || c == L'.') c = '_';
+    for (wchar_t& c : nt) if (c == L'/' || c == L'\\' || c == L':' || c == L'*' || c == L'?' || c == L'"' || c == L'<' || c == L'>' || c == L'|') c = '_';
     // 限制文件名长度，防止超长文件名导致的问题
     if (nt.size() > 200) nt = nt.substr(0, 200);
 

@@ -35,4 +35,9 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: x64\Release\SSLClaw.exe
-        generate_release_notes: true
+        body: |
+          ## SSLClaw ${{ github.ref_name }}
+
+          ### v1.2 变更说明
+          - **统一证书文件命名格式**：HTTP-01 和 DNS-01 申请的证书/私钥文件名统一使用域名原格式（如 `example.com.key`），不再将 `.` 替换为 `_`
+          - 修复此前 HTTP-01 申请时文件名为 `example_com.key` 而 DNS-01 为 `example.com.key` 的不一致问题
