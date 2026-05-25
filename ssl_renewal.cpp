@@ -417,23 +417,56 @@ bool PerformRenewal(RenewalRecord& record) {
 
     // 加载/创建账户密钥
     std::string accKeyPath = W2A(record.saveDir) + "\\acme_account" + W2A(GetAccountKeySuffix()) + ".key";
-    if (!LoadAccountKey(accKeyPath)) { MakeAccountKey(); SavePKEY(accKeyPath); Log(L"[info] 已创建新的账户密钥"); }
+    if (!LoadAccountKey(accKeyPath)) { MakeAccountKey(); SavePKEY(accKeyPath); LogRenewal(L"[续签] 已创建新的账户密钥"); }
+    else { ExtractPublicKey(); LogRenewal(L"[续签] 已加载现有账户密钥"); }
+
+    // 获取 ACME 目录和 Nonce
+    g_AcmeNonce.clear();
+    std::string dir = HttpJson(GetAcmeDirectory(), L"GET", NULL, 0, &g_AcmeNonce);
+    std::string newAcct = JsonStr(dir, "newAccount");
+    std::string newOrder = JsonStr(dir, "newOrder");
+    if (dir.empty()) { LogRenewal(L"[错误] 无法连接 ACME 服务器"); return false; }
+    if (newAcct.empty() || newOrder.empty()) { LogRenewal(L"[错误] 无法解析 ACME 目录响应"); return false; }
+    if (g_AcmeNonce.empty()) {
+        std::string nu = JsonStr(dir, "newNonce");
+        if (!nu.empty()) HttpJson(A2W(nu).c_str(), L"HEAD", NULL, 0, &g_AcmeNonce);
+    }
+    if (g_AcmeNonce.empty()) { LogRenewal(L"[错误] 无法获取 Nonce"); return false; }
+
+    // 注册/查找 ACME 账户
+    {
+        std::string regBody = "{\"termsOfServiceAgreed\":true";
+        if (!record.email.empty()) regBody += ",\"contact\":[\"mailto:" + W2A(record.email) + "\"]";
+        regBody += "}";
+        std::string loc; DWORD regHttp = 0;
+        std::string regResp; bool regOK = false;
+        for (int retry = 0; retry < 10; retry++) {
+            if (g_AcmeNonce.empty()) {
+                std::string nu = JsonStr(dir, "newNonce");
+                if (!nu.empty()) HttpJson(A2W(nu).c_str(), L"HEAD", NULL, 0, &g_AcmeNonce);
+            }
+            if (g_AcmeNonce.empty()) { LogRenewal(L"[错误] 无法获取 Nonce"); break; }
+            regResp = AcmePost(newAcct, regBody, g_AcmeNonce, true, &loc, &regHttp);
+            if (!loc.empty()) { regOK = true; break; }
+            if (regResp.find("badNonce") != std::string::npos || regResp.find("invalid anti-replay") != std::string::npos) {
+                LogRenewal(L"[续签] badNonce, 重试 %d/10...", retry + 1);
+                g_AcmeNonce.clear();
+                Sleep(1000); continue;
+            }
+            break;
+        }
+        if (!regOK) {
+            LogRenewal(L"[错误] 帐户注册失败 (HTTP %d)", regHttp);
+            LogRenewal(L"  响应: %.500S", regResp.c_str());
+            return false;
+        }
+        g_AccURL = loc;
+        std::string regStatus = JsonStr(regResp, "status");
+        LogRenewal(L"[续签] 帐户状态: %s", A2W(regStatus.empty() ? std::string("已存在") : regStatus).c_str());
+    }
 
     // ACME 新订单
     std::string nonce = g_AcmeNonce;
-    if (nonce.empty()) {
-        std::string dir = HttpJson(GetAcmeDirectory(), L"GET", NULL, 0, &nonce);
-        if (nonce.empty()) {
-            std::string nu = JsonStr(dir, "newNonce");
-            if (!nu.empty()) HttpJson(A2W(nu).c_str(), L"HEAD", NULL, 0, &nonce);
-        }
-    }
-    if (nonce.empty()) { LogRenewal(L"[错误] 无法获取 Nonce"); return false; }
-
-    std::string dir = HttpJson(GetAcmeDirectory(), L"GET", NULL, 0, &nonce);
-    std::string newOrder = JsonStr(dir, "newOrder");
-    if (newOrder.empty()) { LogRenewal(L"[错误] 无法解析 ACME 目录"); return false; }
-
     std::string domainA = W2A(record.domain);
     std::string orderPayload = "{\"identifiers\":[{\"type\":\"dns\",\"value\":\"" + domainA + "\"}]}";
     std::string orderUrl; DWORD orderStatus = 0;
