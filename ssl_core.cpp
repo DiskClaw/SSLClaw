@@ -116,7 +116,7 @@ static unsigned ApplyThreadInner() {
     }
     wchar_t* p = td; while (*p == L' ') p++; std::wstring wd = p;
     while (!wd.empty() && wd.back() == L' ') wd.pop_back();
-    if (wd.empty()) { SafeSetStatus(L"域名为空"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+    if (wd.empty()) { SafeSetStatus(L"域名不能为空"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
 
     int verifyMode = (int)SendMessageW(g_hVerifyMode, CB_GETCURSEL, 0, 0);
     bool isWild = g_hWildcard && (SendMessageW(g_hWildcard, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -135,7 +135,7 @@ static unsigned ApplyThreadInner() {
 
     wchar_t dtx[MAX_PATH]; GetWindowTextW(g_hSaveDirEdit, dtx, MAX_PATH);
     if (dtx[0]) g_SaveDir = dtx;
-    if (g_SaveDir.empty()) { SafeSetStatus(L"保存目录为空"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+    if (g_SaveDir.empty()) { SafeSetStatus(L"保存目录不能为空"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
 
     std::wstring nt = wd;
     if (nt.size() >= 2 && nt[0] == L'*' && nt[1] == L'.') nt = L"wildcard." + nt.substr(2);
@@ -165,7 +165,7 @@ static unsigned ApplyThreadInner() {
     Log(L"----------------------------------------");
 
     // Step 1: 加载账户密钥
-    SafeSetStatus(L"加载密钥...");
+    SafeSetStatus(L"加载帐户密钥...");
     Log(L"Step 1: 加载 ACME 帐户密钥...");
     std::string keyPath = W2A(g_SaveDir + L"\\acme_account" + GetAccountKeySuffix() + L".key");
     if (!LoadAccountKey(keyPath)) {

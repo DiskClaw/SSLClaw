@@ -36,8 +36,9 @@ jobs:
       with:
         files: x64\Release\SSLClaw.exe
         body: |
-          ## SSLClaw ${{ github.ref_name }}
+          ### v1.1 变更说明
 
-          ### v1.2 变更说明
-          - **统一证书文件命名格式**：HTTP-01 和 DNS-01 申请的证书/私钥文件名统一使用域名原格式（如 `example.com.key`），不再将 `.` 替换为 `_`
-          - 修复此前 HTTP-01 申请时文件名为 `example_com.key` 而 DNS-01 为 `example.com.key` 的不一致问题
+          - 增加正式环境和测试环境切换
+          - 修复续签功能
+          - 统一证书文件命名格式：HTTP-01 和 DNS-01 申请的证书/私钥文件名统一使用域名原格式，不再将 . 替换为 _
+          - 修复此前 HTTP-01 申请时文件名为 example_com.key 而 DNS-01 为 example.com.key 的不一致问题

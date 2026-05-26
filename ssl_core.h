@@ -178,9 +178,6 @@ bool ExecuteRenewalScript(const std::wstring& script, const std::wstring& domain
 // 续签后 IIS 自动部署
 bool DeployRenewalToIIS(RenewalRecord& record, BCRYPT_KEY_HANDLE dk, const std::string& certPem, const std::wstring& pfxPath);
 
-// 旧计划任务迁移
-void MigrateOldScheduledTask();
-
 // 续签并发控制
 extern std::set<std::wstring> g_RenewingDomains;
 

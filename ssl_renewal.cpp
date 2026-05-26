@@ -138,7 +138,7 @@ static void LogRenewal(const wchar_t* fmt, ...) {
     }
 }
 
-// 只写文件日志 + 状态栏，不显示在主日志栏（用于迁移提醒、续签模式等非关键状态信息）
+// 只写文件日志 + 状态栏，不显示在主日志栏（用于续签模式等非关键状态信息）
 static void LogRenewalStatus(const wchar_t* fmt, ...) {
     va_list args; va_start(args, fmt);
     wchar_t buf[4096]; _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, args); va_end(args);
@@ -291,59 +291,6 @@ bool LoadRenewalRecords(std::vector<RenewalRecord>& records) {
             if (!rec.domain.empty()) records.push_back(rec);
         }
         size_t sl = wcslen(p) + 1; p += sl; len -= (DWORD)(sl * sizeof(wchar_t));
-    }
-    if (!records.empty()) return true;
-
-    // 新格式无记录，检查旧格式 sslclaw_renewals.ini（[Renewal_0] 格式）
-    if (g_IniPath.empty()) return false;
-    std::wstring oldIni = g_IniPath;
-    wchar_t* oslash = wcsrchr(&oldIni[0], L'\\');
-    if (oslash) oslash[1] = 0;
-    oldIni += L"sslclaw_renewals.ini";
-    if (!PathFileExistsW(oldIni.c_str())) return false;
-
-    LogRenewalStatus(L"[迁移] 发现旧格式续签记录: %s", oldIni.c_str());
-    wchar_t oldSecBuf[32768];
-    DWORD oldLen = GetPrivateProfileSectionNamesW(oldSecBuf, 32768, oldIni.c_str());
-    const wchar_t* op = oldSecBuf;
-    while (*op && oldLen > 0) {
-        std::wstring sec(op);
-        if (sec.find(L"Renewal_") == 0) {
-            RenewalRecord rec;
-            wchar_t buf[2048];
-            GetPrivateProfileStringW(sec.c_str(), L"Domain", L"", buf, 2048, oldIni.c_str()); rec.domain = buf;
-            GetPrivateProfileStringW(sec.c_str(), L"VerifyMode", L"0", buf, 2048, oldIni.c_str()); rec.verifyMode = _wtoi(buf);
-            GetPrivateProfileStringW(sec.c_str(), L"ServerType", L"0", buf, 2048, oldIni.c_str()); rec.serverType = _wtoi(buf);
-            GetPrivateProfileStringW(sec.c_str(), L"WebRoot", L"", buf, 2048, oldIni.c_str()); rec.webRoot = buf;
-            GetPrivateProfileStringW(sec.c_str(), L"SaveDir", L"", buf, 2048, oldIni.c_str()); rec.saveDir = buf;
-            GetPrivateProfileStringW(sec.c_str(), L"Email", L"", buf, 2048, oldIni.c_str()); rec.email = buf;
-            GetPrivateProfileStringW(sec.c_str(), L"AutoRenew", L"0", buf, 2048, oldIni.c_str()); rec.autoRenew = (wcscmp(buf, L"1") == 0);
-            GetPrivateProfileStringW(sec.c_str(), L"Thumbprint", L"", buf, 2048, oldIni.c_str()); rec.thumbprint = buf;
-            GetPrivateProfileStringW(sec.c_str(), L"FriendlyName", L"", buf, 2048, oldIni.c_str()); rec.friendlyName = buf;
-            GetPrivateProfileStringW(sec.c_str(), L"IssueTime", L"", buf, 2048, oldIni.c_str()); rec.issueTime = StrToFt(buf);
-            GetPrivateProfileStringW(sec.c_str(), L"ExpiryTime", L"", buf, 2048, oldIni.c_str()); rec.expiryTime = StrToFt(buf);
-            GetPrivateProfileStringW(sec.c_str(), L"RenewalDays", L"7", buf, 2048, oldIni.c_str()); rec.renewalDays = _wtoi(buf);
-            GetPrivateProfileStringW(sec.c_str(), L"PreScript", L"", buf, 2048, oldIni.c_str()); rec.preScript = buf;
-            GetPrivateProfileStringW(sec.c_str(), L"PostScript", L"", buf, 2048, oldIni.c_str()); rec.postScript = buf;
-            GetPrivateProfileStringW(sec.c_str(), L"Wildcard", L"0", buf, 2048, oldIni.c_str()); rec.wildcard = (wcscmp(buf, L"1") == 0);
-            // 通配符强制 DNS-01
-            if (rec.wildcard && rec.verifyMode == 0) {
-                rec.verifyMode = 1;
-                LogRenewalStatus(L"[迁移] %s 是通配符证书，自动切换为 DNS-01 验证", rec.domain.c_str());
-            }
-            if (!rec.domain.empty()) {
-                records.push_back(rec);
-                AddOrUpdateRenewal(rec); // 写入新格式
-                LogRenewalStatus(L"[迁移] 已迁移: %s", rec.domain.c_str());
-            }
-        }
-        size_t sl = wcslen(op) + 1; op += sl; oldLen -= (DWORD)(sl * sizeof(wchar_t));
-    }
-
-    if (!records.empty()) {
-        LogRenewalStatus(L"[迁移] 共迁移 %d 条续签记录到新格式", (int)records.size());
-        std::wstring oldBak = oldIni + L".migrated";
-        MoveFileExW(oldIni.c_str(), oldBak.c_str(), MOVEFILE_REPLACE_EXISTING);
     }
     return !records.empty();
 }
@@ -1371,16 +1318,4 @@ bool IsDomainRenewing(const std::wstring& domain) {
     return result;
 }
 
-// ── 旧计划任务迁移 ──
-void MigrateOldScheduledTask() {
-    if (IsRenewalTaskExists()) {
-        LogRenewalStatus(L"[迁移] 检测到旧的 Windows 计划任务，迁移到后台线程模式");
-        // 删除旧任务
-        DeleteRenewalTask();
-        // 启动后台线程
-        StartRenewalBackgroundThread();
-        LogRenewalStatus(L"[迁移] 计划任务已删除，后台线程已启动");
-        // 通知用户（可选，写入 INI 标记）
-        WritePrivateProfileStringW(L"SSLClaw", L"RenewalMode", L"Background", g_IniPath.c_str());
-    }
-}
+
