@@ -1,9 +1,11 @@
-// ssl_renewal.cpp - 续签系统
+﻿// ssl_renewal.cpp - 续签系统
 #include "ssl_core.h"
 #include "ssl_keyfmt.h"
 #include <set>
 #include <algorithm>
 #include <sstream>
+#include <tlhelp32.h>
+#include <vector>
 
 extern void Log(const wchar_t* fmt, ...);
 extern void LoadDnsConfigForDomain(const std::wstring& domain);
@@ -13,6 +15,8 @@ extern int g_DnsProvider;
 extern HWND g_RenewWnd;
 extern std::wstring g_DnsApiId;
 extern std::wstring g_DnsApiSecret;
+extern std::wstring g_SaveDir;
+extern std::wstring g_IniPath;
 extern bool DnsPreValidateAuthoritative(const std::wstring& queryName, const std::wstring& expectedValue, int maxRetries, int retryInterval);
 extern std::wstring DnsFindZone(int provider, const std::wstring& apiId, const std::wstring& apiSecret,
     const std::wstring& recordName, std::wstring& outZone, std::wstring& outSubDomain);
@@ -26,6 +30,7 @@ extern bool IsPort80Free();
 extern bool StartTempHttpServer(const std::string& token, const std::string& keyAuth);
 extern void StopTempHttpServer();
 extern void SetStatus(const wchar_t* t);
+extern void SafeSetStatus(const wchar_t* t);
 
 extern BCRYPT_KEY_HANDLE g_AccKey;
 extern std::string g_AccPubB64, g_AccExpB64;
@@ -48,6 +53,10 @@ extern std::string W2A(const std::wstring& w);
 extern std::wstring A2W(const std::string& a);
 extern bool WriteFileAtomic(const std::string& path, const std::string& content);
 extern const wchar_t* GetAcmeDirectory();
+extern HWND g_hCAEnv;
+extern int g_CAIndex;
+extern HWND g_hWnd;
+#define WM_LOG_MSG (WM_USER + 0x201)
 
 // ── 后台续签线程全局状态 ──
 static HANDLE g_RenewalThread = NULL;
@@ -57,6 +66,19 @@ std::set<std::wstring> g_RenewingDomains;
 static CRITICAL_SECTION g_RenewCs;
 static bool g_RenewCsInit = false;
 
+// 静态初始化器：程序启动时自动初始化临界区，消除 EnterCriticalSection 时未初始化的崩溃
+static struct _RenewCsInit { _RenewCsInit() { InitializeCriticalSection(&g_RenewCs); g_RenewCsInit = true; } } _renewCsInit;
+volatile LONG g_AcmeBusyFlag = 0;
+
+struct AcmeLock {
+    bool held = false;
+    AcmeLock() {
+        if (InterlockedCompareExchange(&g_AcmeBusyFlag, 1, 0) == 0)
+            held = true;
+    }
+    ~AcmeLock() { if (held) InterlockedExchange(&g_AcmeBusyFlag, 0); }
+};
+
 // ── 续签重试状态 ──
 struct RenewalRetryState {
     std::wstring domain;
@@ -65,18 +87,63 @@ struct RenewalRetryState {
 };
 static std::vector<RenewalRetryState> g_RetryStates;
 
+// ── 从磁盘证书文件读取实际到期时间 ──
+static FILETIME ReadCertExpiryFromDisk(const RenewalRecord& rec) {
+    FILETIME expFt = {};
+    if (rec.saveDir.empty() || rec.domain.empty()) return expFt;
+
+    // 构建文件名：和 PerformRenewal 一样的规则
+    std::wstring nt = rec.domain;
+    if (nt.size() >= 2 && nt[0] == L'*' && nt[1] == L'.') nt = L"wildcard." + nt.substr(2);
+    for (wchar_t& c : nt) if (c == L'/' || c == L'\\' || c == L':' || c == L'*' || c == L'?' || c == L'"' || c == L'<' || c == L'>' || c == L'|') c = L'_';
+
+    // 尝试两种扩展名：.crt / _cert.pem
+    std::wstring certPaths[2] = {
+        rec.saveDir + L"\\" + nt + L".crt",
+        rec.saveDir + L"\\" + nt + L"_cert.pem"
+    };
+    for (int i = 0; i < 2; i++) {
+        if (!PathFileExistsW(certPaths[i].c_str())) continue;
+        HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_FILENAME, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+            CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG, certPaths[i].c_str());
+        if (!hStore) continue;
+        PCCERT_CONTEXT pCert = CertEnumCertificatesInStore(hStore, NULL);
+        if (pCert) {
+            expFt = pCert->pCertInfo->NotAfter;
+            CertFreeCertificateContext(pCert);
+        }
+        CertCloseStore(hStore, 0);
+        if (expFt.dwLowDateTime || expFt.dwHighDateTime) break;
+    }
+    return expFt;
+}
+
 // ── 续签日志文件 ──
 static void LogRenewal(const wchar_t* fmt, ...) {
     va_list args; va_start(args, fmt);
     wchar_t buf[4096]; vswprintf_s(buf, fmt, args); va_end(args);
-    // 统一写 sslclaw.log
     extern void LogToFile(const wchar_t* msg);
     LogToFile(buf);
-    // 更新续签窗口状态栏（ID 106），不写主界面日志
     if (g_RenewWnd) {
         HWND hStatus = GetDlgItem(g_RenewWnd, 106);
-        if (hStatus) SetWindowTextW(hStatus, buf);
+        if (hStatus && GetCurrentThreadId() == GetWindowThreadProcessId(g_RenewWnd, NULL))
+            SetWindowTextW(hStatus, buf);
     }
+    extern HWND g_hWnd;
+    if (g_hWnd) {
+        std::wstring* pMsg = new std::wstring(buf);
+        PostMessageW(g_hWnd, WM_LOG_MSG, 0, (LPARAM)pMsg);
+    }
+}
+
+// 只写文件日志 + 状态栏，不显示在主日志栏（用于迁移提醒、续签模式等非关键状态信息）
+static void LogRenewalStatus(const wchar_t* fmt, ...) {
+    va_list args; va_start(args, fmt);
+    wchar_t buf[4096]; vswprintf_s(buf, fmt, args); va_end(args);
+    extern void LogToFile(const wchar_t* msg);
+    LogToFile(buf);
+    extern void SafeSetStatus(const wchar_t* t);
+    SafeSetStatus(buf);
 }
 
 // ── 脚本执行 ──
@@ -215,6 +282,10 @@ bool LoadRenewalRecords(std::vector<RenewalRecord>& records) {
             GetPrivateProfileStringW(sec.c_str(), L"dnsProvider", L"0", buf, 2048, ini.c_str()); rec.dnsProvider = _wtoi(buf);
             // dnsApiId/dnsApiSecret 续签时从 [DNS:域名] section 动态加载，此处不读取
 
+            // 从磁盘证书文件读取实际到期时间，优先于 INI 记录
+            FILETIME diskExp = ReadCertExpiryFromDisk(rec);
+            if (diskExp.dwLowDateTime || diskExp.dwHighDateTime) rec.expiryTime = diskExp;
+
             if (!rec.domain.empty()) records.push_back(rec);
         }
         size_t sl = wcslen(p) + 1; p += sl; len -= (DWORD)(sl * sizeof(wchar_t));
@@ -229,7 +300,7 @@ bool LoadRenewalRecords(std::vector<RenewalRecord>& records) {
     oldIni += L"sslclaw_renewals.ini";
     if (!PathFileExistsW(oldIni.c_str())) return false;
 
-    LogRenewal(L"[迁移] 发现旧格式续签记录: %s", oldIni.c_str());
+    LogRenewalStatus(L"[迁移] 发现旧格式续签记录: %s", oldIni.c_str());
     wchar_t oldSecBuf[32768];
     DWORD oldLen = GetPrivateProfileSectionNamesW(oldSecBuf, 32768, oldIni.c_str());
     const wchar_t* op = oldSecBuf;
@@ -256,19 +327,19 @@ bool LoadRenewalRecords(std::vector<RenewalRecord>& records) {
             // 通配符强制 DNS-01
             if (rec.wildcard && rec.verifyMode == 0) {
                 rec.verifyMode = 1;
-                LogRenewal(L"[迁移] %s 是通配符证书，自动切换为 DNS-01 验证", rec.domain.c_str());
+                LogRenewalStatus(L"[迁移] %s 是通配符证书，自动切换为 DNS-01 验证", rec.domain.c_str());
             }
             if (!rec.domain.empty()) {
                 records.push_back(rec);
                 AddOrUpdateRenewal(rec); // 写入新格式
-                LogRenewal(L"[迁移] 已迁移: %s", rec.domain.c_str());
+                LogRenewalStatus(L"[迁移] 已迁移: %s", rec.domain.c_str());
             }
         }
         size_t sl = wcslen(op) + 1; op += sl; oldLen -= (DWORD)(sl * sizeof(wchar_t));
     }
 
     if (!records.empty()) {
-        LogRenewal(L"[迁移] 共迁移 %d 条续签记录到新格式", (int)records.size());
+        LogRenewalStatus(L"[迁移] 共迁移 %d 条续签记录到新格式", (int)records.size());
         std::wstring oldBak = oldIni + L".migrated";
         MoveFileExW(oldIni.c_str(), oldBak.c_str(), MOVEFILE_REPLACE_EXISTING);
     }
@@ -404,8 +475,19 @@ bool IsRenewalTaskExists() {
 }
 
 // ── 执行单个续签 ──
-bool PerformRenewal(RenewalRecord& record) {
+// 返回 true=成功，false=失败；*pSkipped=true 表示因锁冲突被跳过（不计入重试）
+bool PerformRenewal(RenewalRecord& record, bool* pSkipped = nullptr) {
+    AcmeLock lock;
+    if (!lock.held) {
+        LogRenewal(L"[续签] ACME 操作进行中，跳过 %s", record.domain.c_str());
+        if (pSkipped) *pSkipped = true;
+        return false;
+    }
+    if (pSkipped) *pSkipped = false;
     LogRenewal(L"\n===== 开始续签: %s =====", record.domain.c_str());
+
+    extern int g_CAEnvIndex;
+    g_CAIndex = g_CAEnvIndex;
 
     // 前置脚本
     if (!record.preScript.empty()) {
@@ -482,7 +564,7 @@ bool PerformRenewal(RenewalRecord& record) {
     std::string authUrl = orderResult.substr(ap, ae - ap);
     std::string finalizeUrl = JsonStr(orderResult, "finalize");
 
-    std::string authResult = AcmePost(authUrl, "{}", nonce, false, NULL, NULL);
+    std::string authResult = AcmePost(authUrl, "", nonce, false, NULL, NULL);
 
     std::string challUrl, token, keyAuth;
     bool useTempServer = false;
@@ -507,7 +589,7 @@ bool PerformRenewal(RenewalRecord& record) {
 
         bool port80Free = IsPort80Free();
         if (port80Free) {
-            SetStatus(L"启动验证服务器...");
+            SafeSetStatus(L"启动验证服务器...");
             LogRenewal(L"[续签] 80 端口空闲，启动临时验证服务器...");
             if (!StartTempHttpServer(token, keyAuth)) {
                 LogRenewal(L"[错误] 临时验证服务器启动失败");
@@ -516,7 +598,7 @@ bool PerformRenewal(RenewalRecord& record) {
             useTempServer = true;
             LogRenewal(L"  临时验证服务器已启动（监听 80 端口）");
         } else {
-            SetStatus(L"写入验证文件...");
+            SafeSetStatus(L"写入验证文件...");
             LogRenewal(L"[续签] Web 服务器运行中，写入验证文件...");
             if (record.webRoot.empty()) { LogRenewal(L"[错误] 需填写网站目录"); return false; }
             std::wstring challDir = record.webRoot + L"\\.well-known\\acme-challenge";
@@ -562,7 +644,7 @@ bool PerformRenewal(RenewalRecord& record) {
         bool hasApi = (record.dnsProvider > 0 && ((!record.dnsApiId.empty() && !record.dnsApiSecret.empty()) || (record.dnsProvider == DNS_PROVIDER_CLOUDFLARE && !record.dnsApiSecret.empty())));
         if (hasApi) {
             // API 自动模式：自动创建 TXT 记录
-            SetStatus(L"自动创建 TXT 记录...");
+            SafeSetStatus(L"自动创建 TXT 记录...");
             LogRenewal(L"[续签] DNS-01 验证 (API 自动模式)");
 
             DnsFindZone(record.dnsProvider, record.dnsApiId, record.dnsApiSecret, wQueryName, zone, subDomain);
@@ -574,12 +656,12 @@ bool PerformRenewal(RenewalRecord& record) {
             LogRenewal(L"  TXT 记录已自动创建");
             dnsApiCreated = true;
 
-            SetStatus(L"等待 DNS 传播...");
+            SafeSetStatus(L"等待 DNS 传播...");
             LogRenewal(L"  等待 DNS 传播 (30秒)...");
             for (int ew = 30; ew > 0; ew -= 5) { Sleep(5000); }
 
             // DNS 权威预验证
-            SetStatus(L"检查 DNS 传播...");
+            SafeSetStatus(L"检查 DNS 传播...");
             bool dnsFound = false;
             if (DnsPreValidateAuthoritative(wQueryName, wChallenge, 5, 10)) {
                 dnsFound = true;
@@ -610,25 +692,43 @@ bool PerformRenewal(RenewalRecord& record) {
     }
 
     // 通知 ACME 验证
-    SetStatus(L"验证域名...");
+    SafeSetStatus(L"验证域名...");
     LogRenewal(L"[续签] 请求 ACME 验证...");
     AcmePost(challUrl, "{}", nonce, false, NULL, NULL);
 
     // 轮询验证状态
     bool verified = false;
-    for (int i = 0; i < (record.verifyMode == 0 ? 12 : 30); i++) {
+    for (int i = 0; i < (record.verifyMode == 0 ? 12 : 60); i++) {
         Sleep(5000);
-        std::string stResult = AcmePost(authUrl, "{}", nonce, false, NULL, NULL);
-        std::string status = JsonStr(stResult, "status");
-        LogRenewal(L"[续签] 验证状态: %S (第 %d 次)", A2W(status).c_str(), i + 1);
-        if (status == "valid") { verified = true; break; }
-        if (status == "invalid") {
+        DWORD pollHttpCode = 0;
+        std::string stResult = AcmePost(authUrl, "", nonce, false, NULL, &pollHttpCode);
+        // 检查 ACME 错误响应（HTTP 4xx/5xx）
+        if (pollHttpCode >= 400) {
+            std::string errType = JsonStr(stResult, "type");
+            std::string errDetail = JsonStr(stResult, "detail");
+            if (errType.find("urn:ietf:params:acme:error:") != std::string::npos) {
+                LogRenewal(L"[错误] ACME 错误 (HTTP %d): %S", pollHttpCode, errDetail.empty() ? stResult.substr(0, 200).c_str() : errDetail.c_str());
+            } else {
+                LogRenewal(L"[错误] 服务器错误 (HTTP %d): %.200S", pollHttpCode, stResult.c_str());
+            }
+            break;
+        }
+        std::string vStatus = JsonStr(stResult, "status");
+        if (vStatus == "valid") { verified = true; break; }
+        if (vStatus == "invalid") {
             if (useTempServer) StopTempHttpServer();
             else if (record.verifyMode == 0 && !challFile.empty()) DeleteFileW(challFile.c_str());
             if (dnsApiCreated) DnsDeleteTxtRecord(record.dnsProvider, record.dnsApiId, record.dnsApiSecret, zone, subDomain);
             LogRenewal(L"[错误] 验证失败");
+            SafeSetStatus(L"验证失败");
             SendNotificationEmail(L"SSLClaw 续签失败: " + record.domain, L"原因: ACME 服务器验证失败", record.saveDir, g_IniPath);
             return false;
+        }
+        if (vStatus.empty()) {
+            if (i < 3) LogRenewal(L"[调试] ACME 原始响应(%d): %.300S", i + 1, stResult.c_str());
+            LogRenewal(L"[续签] 等待... (%d/%d) [状态解析失败]", i + 1, record.verifyMode == 0 ? 12 : 60);
+        } else {
+            LogRenewal(L"[续签] 等待... (%d/%d) [状态: %S]", i + 1, record.verifyMode == 0 ? 12 : 60, vStatus.c_str());
         }
     }
 
@@ -637,19 +737,21 @@ bool PerformRenewal(RenewalRecord& record) {
     else if (record.verifyMode == 0 && !challFile.empty()) _wunlink(challFile.c_str());
     if (dnsApiCreated) { DnsDeleteTxtRecord(record.dnsProvider, record.dnsApiId, record.dnsApiSecret, zone, subDomain); LogRenewal(L"  TXT 记录已清理"); }
 
-    if (!verified) { LogRenewal(L"[错误] 验证超时"); return false; }
+    if (!verified) { LogRenewal(L"[错误] 验证超时"); SafeSetStatus(L"验证超时"); return false; }
+    LogRenewal(L"  验证通过");
+    SafeSetStatus(L"验证通过，正在签发证书...");
 
     // 生成域密钥
     BCRYPT_ALG_HANDLE ha = NULL;
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&ha, BCRYPT_RSA_ALGORITHM, NULL, 0);
-    if (status != 0) { LogRenewal(L"[错误] 无法打开算法提供者"); return false; }
+    NTSTATUS ntStatus = BCryptOpenAlgorithmProvider(&ha, BCRYPT_RSA_ALGORITHM, NULL, 0);
+    if (ntStatus != 0) { LogRenewal(L"[错误] 无法打开算法提供者"); return false; }
     
     BCRYPT_KEY_HANDLE dk = NULL;
-    status = BCryptGenerateKeyPair(ha, &dk, 2048, 0);
-    if (status != 0) { BCryptCloseAlgorithmProvider(ha, 0); LogRenewal(L"[错误] 无法生成密钥对"); return false; }
+    ntStatus = BCryptGenerateKeyPair(ha, &dk, 2048, 0);
+    if (ntStatus != 0) { BCryptCloseAlgorithmProvider(ha, 0); LogRenewal(L"[错误] 无法生成密钥对"); return false; }
     
-    status = BCryptFinalizeKeyPair(dk, 0);
-    if (status != 0) { BCryptDestroyKey(dk); BCryptCloseAlgorithmProvider(ha, 0); LogRenewal(L"[错误] 无法完成密钥对"); return false; }
+    ntStatus = BCryptFinalizeKeyPair(dk, 0);
+    if (ntStatus != 0) { BCryptDestroyKey(dk); BCryptCloseAlgorithmProvider(ha, 0); LogRenewal(L"[错误] 无法完成密钥对"); return false; }
     
     BCryptCloseAlgorithmProvider(ha, 0);
 
@@ -657,26 +759,43 @@ bool PerformRenewal(RenewalRecord& record) {
     std::vector<BYTE> csr = BuildCSR(domainA, dk, NULL);
     std::string csr64 = B64Url(csr);
     std::string finalizePayload = "{\"csr\":\"" + csr64 + "\"}";
-    AcmePost(finalizeUrl, finalizePayload, nonce, false, NULL, NULL);
+    DWORD finHttpCode = 0;
+    std::string finResp = AcmePost(finalizeUrl, finalizePayload, nonce, false, NULL, &finHttpCode);
+    int finRetries = 0;
+    while (finHttpCode == 400 && finResp.find("badNonce") != std::string::npos && finRetries < 2) {
+        finRetries++; LogRenewal(L"[续签] 重试提交 CSR (badNonce, 第%d次)...", finRetries);
+        finResp = AcmePost(finalizeUrl, finalizePayload, nonce, false, NULL, &finHttpCode);
+    }
+    if (finResp.empty()) {
+        LogRenewal(L"[错误] 订单完成失败 (HTTP %d)", finHttpCode);
+        BCryptDestroyKey(dk); return false;
+    }
+    if (finHttpCode >= 400) {
+        std::string finErr = JsonStr(finResp, "detail");
+        LogRenewal(L"[错误] CSR 提交被拒 (HTTP %d): %S", finHttpCode, finErr.empty() ? finResp.substr(0, 200).c_str() : finErr.c_str());
+        BCryptDestroyKey(dk); return false;
+    }
+    std::string finStatus = JsonStr(finResp, "status");
+    std::string certUrl = JsonStr(finResp, "certificate");
+    LogRenewal(L"[续签] 订单状态: %S", finStatus.empty() ? "未知" : finStatus.c_str());
 
-    // 轮询订单状态
-    std::string certUrl;
-    for (int i = 0; i < 60; i++) {
-        Sleep(2000);
-        std::string ordResult = AcmePost(orderUrl, "{}", nonce, false, NULL, NULL);
-        std::string status = JsonStr(ordResult, "status");
-        if (status == "valid") {
-            size_t cp = ordResult.find("\"certificate\":\"");
-            if (cp != std::string::npos) { cp += 16; size_t ce = ordResult.find("\"", cp); if (ce != std::string::npos) certUrl = ordResult.substr(cp, ce - cp); }
-            break;
-        }
-        if (status == "invalid") { 
-            LogRenewal(L"[错误] 订单验证失败"); 
-            if (dk) { BCryptDestroyKey(dk); dk = NULL; }
-            return false; 
+    // 等待证书（轮询订单状态，等待 status 不再是 pending/processing/ready）
+    if (certUrl.empty()) {
+        for (int i = 0; i < 15; i++) {
+            Sleep(3000);
+            std::string ordResult = AcmePost(orderUrl, "", nonce, false, NULL, NULL);
+            std::string orderCheckStatus = JsonStr(ordResult, "status");
+            if (orderCheckStatus == "invalid") {
+                std::string errDetail = JsonStr(ordResult, "error");
+                LogRenewal(L"[错误] 订单状态无效: %S", errDetail.empty() ? ordResult.substr(0, 200).c_str() : errDetail.c_str());
+                BCryptDestroyKey(dk); return false;
+            }
+            certUrl = JsonStr(ordResult, "certificate");
+            if (!certUrl.empty()) break;
+            LogRenewal(L"[续签] 等待... (%d/15) 状态: %S", i + 1, orderCheckStatus.empty() ? "未知" : orderCheckStatus.c_str());
         }
     }
-    if (certUrl.empty()) { LogRenewal(L"[错误] 未获取证书 URL"); BCryptDestroyKey(dk); return false; }
+    if (certUrl.empty()) { LogRenewal(L"[错误] 获取证书下载链接超时"); BCryptDestroyKey(dk); return false; }
 
     // 下载证书
     std::string certResult = AcmePost(certUrl, "", nonce, false, NULL, NULL);
@@ -687,28 +806,38 @@ bool PerformRenewal(RenewalRecord& record) {
     if (nt.size() >= 2 && nt[0] == L'*' && nt[1] == L'.') nt = L"wildcard." + nt.substr(2);
     for (wchar_t& c : nt) if (c == L'/' || c == L'\\' || c == L':' || c == L'*' || c == L'?' || c == L'"' || c == L'<' || c == L'>' || c == L'|') c = L'_';
 
+    // 确保保存目录存在
+    std::wstring saveDirW = record.saveDir;
+    for (size_t i = 1; i <= saveDirW.size(); i++) {
+        if (i == saveDirW.size() || saveDirW[i] == L'\\') {
+            wchar_t orig = saveDirW[i]; saveDirW[i] = L'\0';
+            CreateDirectoryW(saveDirW.c_str(), NULL);
+            saveDirW[i] = orig;
+        }
+    }
+
     // 保存私钥（根据服务器类型选择格式）
     bool needPkcs1 = (record.serverType == 0 || record.serverType == 1);
     bool needPem = (record.serverType == 3);
     std::string keyExt = needPem ? "_key.pem" : ".key";
     std::string keyPath = W2A(record.saveDir) + "\\" + W2A(nt) + keyExt;
     std::string pem;
-    status = 0;
+    ntStatus = 0;
     if (needPkcs1) {
         DWORD fl = 0;
-        status = BCryptExportKey(dk, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, 0, &fl, 0);
-        if (status == 0 && fl > 0) {
+        ntStatus = BCryptExportKey(dk, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, 0, &fl, 0);
+        if (ntStatus == 0 && fl > 0) {
             std::vector<BYTE> fb(fl);
-            status = BCryptExportKey(dk, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, fb.data(), fl, &fl, 0);
-            if (status == 0) pem = RsaFullBlobToPkcs1Pem(fb);
+            ntStatus = BCryptExportKey(dk, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, fb.data(), fl, &fl, 0);
+            if (ntStatus == 0) pem = RsaFullBlobToPkcs1Pem(fb);
         }
         if (pem.empty()) {
             DWORD pl = 0;
-            status = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, 0, &pl, 0);
-            if (status == 0 && pl > 0) {
+            ntStatus = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, 0, &pl, 0);
+            if (ntStatus == 0 && pl > 0) {
                 std::vector<BYTE> pkv(pl);
-                status = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, pkv.data(), pl, &pl, 0);
-                if (status == 0) {
+                ntStatus = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, pkv.data(), pl, &pl, 0);
+                if (ntStatus == 0) {
                     std::string bp = B64Pem(pkv);
                     std::string pkcs8 = "-----BEGIN PRIVATE KEY-----\r\n" + bp + "\r\n-----END PRIVATE KEY-----\r\n";
                     pem = Pkcs8PemToPkcs1Pem(pkcs8);
@@ -717,31 +846,31 @@ bool PerformRenewal(RenewalRecord& record) {
         }
     } else if (needPem) {
         DWORD pl = 0;
-        status = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, 0, &pl, 0);
-        if (status == 0 && pl > 0) {
+        ntStatus = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, 0, &pl, 0);
+        if (ntStatus == 0 && pl > 0) {
             std::vector<BYTE> pkv(pl);
-            status = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, pkv.data(), pl, &pl, 0);
-            if (status == 0) {
+            ntStatus = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, pkv.data(), pl, &pl, 0);
+            if (ntStatus == 0) {
                 std::string bp = B64Pem(pkv);
                 pem = "-----BEGIN PRIVATE KEY-----\r\n" + bp + "\r\n-----END PRIVATE KEY-----\r\n";
             }
         }
         if (pem.empty()) {
             DWORD fl = 0;
-            status = BCryptExportKey(dk, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, 0, &fl, 0);
-            if (status == 0 && fl > 0) {
+            ntStatus = BCryptExportKey(dk, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, 0, &fl, 0);
+            if (ntStatus == 0 && fl > 0) {
                 std::vector<BYTE> fb(fl);
-                status = BCryptExportKey(dk, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, fb.data(), fl, &fl, 0);
-                if (status == 0) pem = RsaFullBlobToPkcs8Pem(fb);
+                ntStatus = BCryptExportKey(dk, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, fb.data(), fl, &fl, 0);
+                if (ntStatus == 0) pem = RsaFullBlobToPkcs8Pem(fb);
             }
         }
     } else {
         DWORD pl = 0;
-        status = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, 0, &pl, 0);
-        if (status == 0 && pl > 0) {
+        ntStatus = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, 0, &pl, 0);
+        if (ntStatus == 0 && pl > 0) {
             std::vector<BYTE> pkv(pl);
-            status = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, pkv.data(), pl, &pl, 0);
-            if (status == 0) {
+            ntStatus = BCryptExportKey(dk, NULL, BCRYPT_PKCS8_PRIVATE_KEY_BLOB, pkv.data(), pl, &pl, 0);
+            if (ntStatus == 0) {
                 std::string bp = B64Pem(pkv);
                 pem = "-----BEGIN PRIVATE KEY-----\r\n" + bp + "\r\n-----END PRIVATE KEY-----\r\n";
             }
@@ -749,12 +878,13 @@ bool PerformRenewal(RenewalRecord& record) {
     }
     bool keySaved = false;
     if (pem.empty()) {
-        LogRenewal(L"[错误] 私钥导出失败 (0x%08X)", status);
+        LogRenewal(L"[错误] 私钥导出失败 (0x%08X)", ntStatus);
     } else if (WriteFileAtomic(keyPath, pem)) {
         LogRenewal(L"  私钥已保存: %s%s (%s)", nt.c_str(), A2W(keyExt).c_str(), needPkcs1 ? L"PKCS#1" : L"PKCS#8");
         keySaved = true;
     } else {
-        LogRenewal(L"[错误] 私钥保存失败: %s%s", nt.c_str(), A2W(keyExt).c_str());
+        DWORD err = GetLastError();
+        LogRenewal(L"[错误] 私钥保存失败: %s%s (GetLastError=%u, 路径=%S)", nt.c_str(), A2W(keyExt).c_str(), err, keyPath.c_str());
     }
 
     bool certSaved = false;
@@ -764,7 +894,8 @@ bool PerformRenewal(RenewalRecord& record) {
         LogRenewal(L"  证书已保存: %s%s", nt.c_str(), A2W(certExt).c_str());
         certSaved = true;
     } else {
-        LogRenewal(L"[错误] 证书保存失败: %s%s", nt.c_str(), A2W(certExt).c_str());
+        DWORD err = GetLastError();
+        LogRenewal(L"[错误] 证书保存失败: %s%s (GetLastError=%u, 路径=%S)", nt.c_str(), A2W(certExt).c_str(), err, certPath.c_str());
     }
 
     bool pfxSaved = false;
@@ -832,6 +963,7 @@ bool PerformRenewal(RenewalRecord& record) {
     record.expiryTime = certExpFt;
 
     LogRenewal(L"[续签] 续签成功: %s", record.domain.c_str());
+    SafeSetStatus(L"续签成功");
 
     // 邮件通知
     SendNotificationEmail(L"SSLClaw 续签成功: " + record.domain,
@@ -844,39 +976,91 @@ bool PerformRenewal(RenewalRecord& record) {
         ExecuteRenewalScript(record.postScript, record.domain);
     }
 
+    // 续签成功后建议手动重载 Web 服务器（Nginx/Apache/Caddy）以加载新证书
+
     LogRenewal(L"[续签] %s 续签完成，下次过期: %s", record.domain.c_str(), FtToStr(record.expiryTime).c_str());
     return true;
 }
 
 // ── CLI 自动续签模式 ──
+static bool g_RenewalModeRunning = false;
+
 int RunRenewalMode() {
-    LogRenewal(L"[续签模式] 启动自动续签...");
+    // 防止重复执行：同一时刻只允许一个续签流程
+    EnterCriticalSection(&g_RenewCs);
+    if (g_RenewalModeRunning) {
+        LeaveCriticalSection(&g_RenewCs);
+        LogRenewalStatus(L"[续签模式] 已有续签流程运行中，跳过");
+        return 0;
+    }
+    g_RenewalModeRunning = true;
+    LeaveCriticalSection(&g_RenewCs);
+
+    LogRenewalStatus(L"[续签模式] 启动自动续签...");
+
+    // 如果后台线程正在运行，唤醒它处理续签，不重复执行
+    if (g_RenewalThreadRunning) {
+        LogRenewalStatus(L"[续签模式] 后台线程运行中，唤醒处理");
+        WakeRenewalCheck();
+        g_RenewalModeRunning = false;
+        return 0;
+    }
 
     std::vector<RenewalRecord> records;
     if (!LoadRenewalRecords(records)) {
-        LogRenewal(L"[续签模式] 无续签记录");
+        LogRenewalStatus(L"[续签模式] 无续签记录");
+        g_RenewalModeRunning = false;
         return 0;
+    }
+
+    // 从主配置读取当前保存目录，覆盖续签记录中的旧路径
+    {
+        wchar_t iniBuf[2048];
+        GetPrivateProfileStringW(L"SSLClaw", L"SaveDir", L"", iniBuf, 2048, g_IniPath.c_str());
+        std::wstring mainSaveDir(iniBuf);
+        if (!mainSaveDir.empty()) {
+            for (auto& rec : records) {
+                rec.saveDir = mainSaveDir;
+            }
+            LogRenewal(L"[续签] 使用保存目录: %s", mainSaveDir.c_str());
+        }
     }
 
     std::vector<int> due = GetRenewalsDue(records);
 
     if (due.empty()) {
-        LogRenewal(L"[续签模式] 没有需要续签的证书");
+        LogRenewalStatus(L"[续签模式] 没有需要续签的证书");
+        g_RenewalModeRunning = false;
         return 0;
     }
 
     int success = 0, failed = 0;
     for (int idx : due) {
+        EnterCriticalSection(&g_RenewCs);
+        bool alreadyRenewing = g_RenewingDomains.count(records[idx].domain) > 0;
+        if (!alreadyRenewing) g_RenewingDomains.insert(records[idx].domain);
+        LeaveCriticalSection(&g_RenewCs);
+
+        if (alreadyRenewing) {
+            LogRenewal(L"[续签] %s 正在续签中，跳过", records[idx].domain.c_str());
+            continue;
+        }
+
         LogRenewal(L"[续签] 处理: %s (过期: %s)", records[idx].domain.c_str(), FtToStr(records[idx].expiryTime).c_str());
         if (PerformRenewalWithRetry(records[idx])) {
-            AddOrUpdateRenewal(records[idx]);  // ★ 持久化更新后的签发/过期时间
+            AddOrUpdateRenewal(records[idx]);
             success++;
         } else {
             failed++;
         }
+
+        EnterCriticalSection(&g_RenewCs);
+        g_RenewingDomains.erase(records[idx].domain);
+        LeaveCriticalSection(&g_RenewCs);
     }
 
     LogRenewal(L"\n[续签] 完成: 成功 %d, 失败 %d", success, failed);
+    g_RenewalModeRunning = false;
     return (failed > 0) ? 1 : 0;
 }
 
@@ -898,7 +1082,13 @@ bool PerformRenewalWithRetry(RenewalRecord& record) {
     int attempt = rs->attemptCount;
     LogRenewal(L"[续签] %s 第 %d 次尝试", record.domain.c_str(), attempt);
 
-    bool success = PerformRenewal(record);
+    bool skipped = false;
+    bool success = PerformRenewal(record, &skipped);
+
+    if (skipped) {
+        // 锁冲突不算重试，下次触发自然会再次尝试
+        return false;
+    }
 
     if (success) {
         // 成功后清除重试状态
@@ -1051,16 +1241,28 @@ bool DeployRenewalToIIS(RenewalRecord& record, BCRYPT_KEY_HANDLE dk, const std::
 
 // ── 后台续签线程 ──
 unsigned __stdcall RenewalCheckThread(void* param) {
-    LogRenewal(L"[后台] 续签线程已启动");
+    LogRenewalStatus(L"[后台] 续签线程已启动");
 
     // 初始延迟 30 秒让 UI 稳定
     for (int i = 0; i < 30 && g_RenewalThreadRunning; i++) Sleep(1000);
 
     while (g_RenewalThreadRunning) {
-        LogRenewal(L"[后台] 检查续签记录...");
+        LogRenewalStatus(L"[后台] 检查续签记录...");
 
         std::vector<RenewalRecord> records;
         LoadRenewalRecords(records);
+
+        // 从主配置读取当前保存目录，覆盖续签记录中的旧路径
+        {
+            wchar_t iniBuf[2048];
+            GetPrivateProfileStringW(L"SSLClaw", L"SaveDir", L"", iniBuf, 2048, g_IniPath.c_str());
+            std::wstring mainSaveDir(iniBuf);
+            if (!mainSaveDir.empty()) {
+                for (auto& rec : records) {
+                    rec.saveDir = mainSaveDir;
+                }
+            }
+        }
 
         // 获取需要续签的记录
         std::vector<int> due = GetRenewalsDue(records);
@@ -1084,9 +1286,9 @@ unsigned __stdcall RenewalCheckThread(void* param) {
         }
 
         if (due.empty()) {
-            LogRenewal(L"[后台] 暂无需要续签的证书");
+            LogRenewalStatus(L"[后台] 暂无需要续签的证书");
         } else {
-            LogRenewal(L"[后台] 发现 %d 个证书需要处理", (int)due.size());
+            LogRenewalStatus(L"[后台] 发现 %d 个证书需要处理", (int)due.size());
         }
 
         for (int idx : due) {
@@ -1099,7 +1301,7 @@ unsigned __stdcall RenewalCheckThread(void* param) {
             LeaveCriticalSection(&g_RenewCs);
 
             if (alreadyRenewing) {
-                LogRenewal(L"[后台] %s 正在续签中，跳过", records[idx].domain.c_str());
+                LogRenewalStatus(L"[后台] %s 正在续签中，跳过", records[idx].domain.c_str());
                 continue;
             }
 
@@ -1107,7 +1309,7 @@ unsigned __stdcall RenewalCheckThread(void* param) {
 
             if (success) {
                 AddOrUpdateRenewal(records[idx]);
-                LogRenewal(L"[后台] %s 续签成功，记录已持久化", records[idx].domain.c_str());
+                LogRenewalStatus(L"[后台] %s 续签成功，记录已持久化", records[idx].domain.c_str());
             }
 
             EnterCriticalSection(&g_RenewCs);
@@ -1119,23 +1321,22 @@ unsigned __stdcall RenewalCheckThread(void* param) {
         for (int i = 0; i < RENEWAL_CHECK_INTERVAL_SEC && g_RenewalThreadRunning; i++) {
             if (g_RenewalWakeEvent && WaitForSingleObject(g_RenewalWakeEvent, 1000) == WAIT_OBJECT_0) {
                 ResetEvent(g_RenewalWakeEvent);
-                LogRenewal(L"[后台] 收到唤醒信号，立即检查");
+                LogRenewalStatus(L"[后台] 收到唤醒信号，立即检查");
                 break;
             }
         }
     }
 
-    LogRenewal(L"[后台] 续签线程已退出");
+    LogRenewalStatus(L"[后台] 续签线程已退出");
     return 0;
 }
 
 void StartRenewalBackgroundThread() {
     if (g_RenewalThreadRunning) return;
     g_RenewalThreadRunning = true;
-    if (!g_RenewCsInit) { InitializeCriticalSection(&g_RenewCs); g_RenewCsInit = true; }
     g_RenewalWakeEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_RenewalThread = (HANDLE)_beginthreadex(NULL, 0, RenewalCheckThread, NULL, 0, NULL);
-    LogRenewal(L"[后台] 后台线程已启动");
+    LogRenewalStatus(L"[后台] 后台线程已启动");
 }
 
 void StopRenewalBackgroundThread() {
@@ -1148,8 +1349,8 @@ void StopRenewalBackgroundThread() {
         g_RenewalThread = NULL;
     }
     if (g_RenewalWakeEvent) { CloseHandle(g_RenewalWakeEvent); g_RenewalWakeEvent = NULL; }
-    if (g_RenewCsInit) { DeleteCriticalSection(&g_RenewCs); g_RenewCsInit = false; }
-    LogRenewal(L"[后台] 后台线程已停止");
+    // g_RenewCs 由静态初始化器管理，不在此处销毁
+    LogRenewalStatus(L"[后台] 后台线程已停止");
 }
 
 void WakeRenewalCheck() {
@@ -1171,12 +1372,12 @@ bool IsDomainRenewing(const std::wstring& domain) {
 // ── 旧计划任务迁移 ──
 void MigrateOldScheduledTask() {
     if (IsRenewalTaskExists()) {
-        LogRenewal(L"[迁移] 检测到旧的 Windows 计划任务，迁移到后台线程模式");
+        LogRenewalStatus(L"[迁移] 检测到旧的 Windows 计划任务，迁移到后台线程模式");
         // 删除旧任务
         DeleteRenewalTask();
         // 启动后台线程
         StartRenewalBackgroundThread();
-        LogRenewal(L"[迁移] 计划任务已删除，后台线程已启动");
+        LogRenewalStatus(L"[迁移] 计划任务已删除，后台线程已启动");
         // 通知用户（可选，写入 INI 标记）
         WritePrivateProfileStringW(L"SSLClaw", L"RenewalMode", L"Background", g_IniPath.c_str());
     }

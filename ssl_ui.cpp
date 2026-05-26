@@ -11,6 +11,149 @@
 #include <shellapi.h>
 #include <functional>
 #include <process.h>
+#include <tlhelp32.h>
+#include <set>
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "version.lib")
+
+// ── 检测本地 Web 服务器 ──
+// 从进程 PID 获取可执行文件路径
+static std::wstring GetProcessPath(DWORD pid) {
+    std::wstring path;
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProc) {
+        wchar_t buf[MAX_PATH] = {};
+        DWORD sz = MAX_PATH;
+        if (QueryFullProcessImageNameW(hProc, 0, buf, &sz)) path = buf;
+        CloseHandle(hProc);
+    }
+    return path;
+}
+
+// 从 PE 文件提取产品版本号
+static std::wstring GetFileVersion(const wchar_t* path) {
+    DWORD handle = 0;
+    DWORD sz = GetFileVersionInfoSizeW(path, &handle);
+    if (sz == 0) return L"";
+    std::vector<BYTE> buf(sz);
+    if (!GetFileVersionInfoW(path, handle, sz, buf.data())) return L"";
+    VS_FIXEDFILEINFO* fi = nullptr; UINT fiLen = 0;
+    if (VerQueryValueW(buf.data(), L"\\", (void**)&fi, &fiLen) && fi && fiLen >= sizeof(*fi)) {
+        wchar_t v[64]; swprintf_s(v, L"%d.%d", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS));
+        if (LOWORD(fi->dwFileVersionLS) || HIWORD(fi->dwFileVersionLS))
+            swprintf_s(v, L"%d.%d.%d", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionLS));
+        return v;
+    }
+    return L"";
+}
+
+// 截取文件所在目录的简短路径（最多取最后 2 级）
+static std::wstring ShortDir(const std::wstring& fullPath) {
+    if (fullPath.empty()) return L"";
+    size_t lastSlash = fullPath.rfind(L'\\');
+    if (lastSlash == std::wstring::npos) return L"";
+    std::wstring dir = fullPath.substr(0, lastSlash);
+    size_t prevSlash = dir.rfind(L'\\');
+    if (prevSlash != std::wstring::npos && prevSlash > 0) {
+        size_t ppSlash = dir.rfind(L'\\', prevSlash - 1);
+        if (ppSlash != std::wstring::npos) dir = dir.substr(ppSlash + 1);
+    }
+    return dir;
+}
+
+struct WebServerInfo { std::wstring name; std::wstring version; std::wstring path; };
+
+static std::wstring DetectWebServer() {
+    std::vector<WebServerInfo> results;
+    std::set<std::wstring> seen;  // 按 name 去重
+
+    // 1) 扫描 Windows 服务 — 拿到服务名 + 可执行路径 + 版本
+    struct SvcInfo { const wchar_t* svcName; const wchar_t* tag; };
+    SvcInfo svcList[] = {
+        { L"W3SVC",         L"IIS" },
+        { L"nginx",         L"Nginx" },
+        { L"Apache2.4",     L"Apache" },
+        { L"Apache2.2",     L"Apache" },
+        { L"wampapache64",  L"Apache" },
+        { L"wampapache",    L"Apache" },
+        { L"caddy",         L"Caddy" },
+    };
+    SC_HANDLE hSCM = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+    if (hSCM) {
+        for (auto& si : svcList) {
+            SC_HANDLE hSvc = OpenServiceW(hSCM, si.svcName, SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG);
+            if (!hSvc) continue;
+            SERVICE_STATUS status = {};
+            if (QueryServiceStatus(hSvc, &status) && status.dwCurrentState == SERVICE_RUNNING) {
+                if (seen.find(si.tag) == seen.end()) {
+                    seen.insert(si.tag);
+                    WebServerInfo info; info.name = si.tag;
+                    // 尝试读取服务可执行路径
+                    DWORD need = 0; QueryServiceConfigW(hSvc, NULL, 0, &need);
+                    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                        std::vector<BYTE> cfg(need);
+                        QUERY_SERVICE_CONFIGW* qsc = (QUERY_SERVICE_CONFIGW*)cfg.data();
+                        if (QueryServiceConfigW(hSvc, qsc, need, &need) && qsc->lpBinaryPathName) {
+                            // 去掉引号和参数，取实际 exe 路径
+                            std::wstring bp = qsc->lpBinaryPathName;
+                            if (bp[0] == L'\"') { bp = bp.substr(1); size_t q = bp.find(L'\"'); if (q != std::wstring::npos) bp = bp.substr(0, q); }
+                            else { size_t sp = bp.find(L' '); if (sp != std::wstring::npos) bp = bp.substr(0, sp); }
+                            info.path = bp;
+                            info.version = GetFileVersion(bp.c_str());
+                        }
+                    }
+                    results.push_back(info);
+                }
+            }
+            CloseServiceHandle(hSvc);
+        }
+        CloseServiceHandle(hSCM);
+    }
+
+    // 2) 扫描进程 — 补充服务检测不到的（非服务方式运行）
+    struct ProcInfo { const wchar_t* exeName; const wchar_t* tag; };
+    ProcInfo procList[] = {
+        { L"nginx.exe",     L"Nginx" },
+        { L"httpd.exe",     L"Apache" },
+        { L"apache.exe",    L"Apache" },
+        { L"caddy.exe",     L"Caddy" },
+        { L"h2o.exe",       L"H2O" },
+        { L"openresty.exe", L"OpenResty" },
+        { L"w3wp.exe",      L"IIS" },
+    };
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe = {}; pe.dwSize = sizeof(pe);
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                for (auto& pi : procList) {
+                    if (_wcsicmp(pe.szExeFile, pi.exeName) == 0) {
+                        if (seen.find(pi.tag) == seen.end()) {
+                            seen.insert(pi.tag);
+                            WebServerInfo info; info.name = pi.tag;
+                            info.path = GetProcessPath(pe.th32ProcessID);
+                            if (!info.path.empty()) info.version = GetFileVersion(info.path.c_str());
+                            results.push_back(info);
+                        }
+                        break;
+                    }
+                }
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+
+    if (results.empty()) return L"";
+    std::wstring result;
+    for (size_t i = 0; i < results.size(); i++) {
+        if (i > 0) result += L"  ";
+        auto& r = results[i];
+        result += L"\u25CF " + r.name;
+        if (!r.version.empty()) result += L" " + r.version;
+        if (!r.path.empty()) result += L" (" + ShortDir(r.path) + L")";
+    }
+    return result;
+}
 
 // 续签窗口原过程（全局变量，用于子类化恢复）
 static WNDPROC g_OrigRenewProc = NULL;
@@ -22,6 +165,7 @@ static bool g_TrayVisible = false;
 static NOTIFYICONDATAW g_TrayNid = {};
 #define TRAY_ID  1001
 #define WM_TRAY  (WM_USER + 0x200)
+#define WM_LOG_MSG (WM_USER + 0x201)
 #define IDM_SHOW  40001
 #define IDM_EXIT  40002
 
@@ -30,6 +174,13 @@ int g_DnsProvider = DNS_PROVIDER_ALIYUN;
 std::wstring g_DnsApiId;
 std::wstring g_DnsApiSecret;
 static std::wstring g_DnsConfigDomain;
+
+// 日志临界区：保护 g_hLog 编辑控件不被并发操作
+static CRITICAL_SECTION g_LogCs;
+static bool g_LogCsInit = false;
+static void InitLogCs() {
+    if (!g_LogCsInit) { InitializeCriticalSection(&g_LogCs); g_LogCsInit = true; }
+}
 
 static std::wstring DnsSectionName(const std::wstring& domain) {
     return L"DNS:" + domain;
@@ -210,9 +361,9 @@ static LRESULT CALLBACK DnsConfigDlgProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp
                 HANDLE hThread = (HANDLE)_beginthreadex(0, 0, [](void* p)->unsigned {
                     VerifyParams* params = (VerifyParams*)p;
                     bool apiOk = DnsVerifyApi(params->provider, params->apiId, params->apiSecret);
-                    SendMessageW(params->hStatus, WM_SETTEXT, 0, (LPARAM)(apiOk ? L"验证通过" : L"验证失败(密钥无效)"));
-                    SendMessageW(params->hBtn, WM_SETTEXT, 0, (LPARAM)L"验证密钥");
-                    EnableWindow(params->hBtn, TRUE);
+                    SafeSetWindowText(params->hStatus, apiOk ? L"验证通过" : L"验证失败(密钥无效)");
+                    SafeSetWindowText(params->hBtn, L"验证密钥");
+                    SafeEnableWindow(params->hBtn, TRUE);
                     delete params;
                     return 0;
                 }, params, 0, 0);
@@ -471,14 +622,21 @@ static void ShowDetailDialog(HWND hwParent) {
         else swprintf_s(daysStr, L"已过期 %d 天", -d);
     }
 
-    wchar_t msg[1024];
-    swprintf_s(msg, L"域名: %s%s\nFriendlyName: %s\n签发: %s  过期: %s\n剩余: %s\n自动续签: %s  阈值: %d 天\n验证: %s  邮箱: %s\n指纹: %s",
+    extern std::wstring g_IniPath;
+    wchar_t iniBuf[2048];
+    GetPrivateProfileStringW(L"SSLClaw", L"SaveDir", L"", iniBuf, 2048, g_IniPath.c_str());
+    std::wstring displaySaveDir(iniBuf);
+    if (displaySaveDir.empty()) displaySaveDir = r.saveDir;
+
+    wchar_t msg[2048];
+    swprintf_s(msg, L"域名: %s%s\nFriendlyName: %s\n签发: %s  过期: %s\n剩余: %s\n自动续签: %s  阈值: %d 天\n验证: %s  邮箱: %s\n保存目录: %s\n指纹: %s",
         r.wildcard ? L"*." : L"", r.domain.c_str(),
         r.friendlyName.empty() ? L"(无)" : r.friendlyName.c_str(),
         issueStr, expiryStr, daysStr,
         r.autoRenew ? L"是" : L"否", r.renewalDays,
         r.verifyMode == 0 ? L"HTTP-01" : L"DNS-01",
         r.email.empty() ? L"(无)" : r.email.c_str(),
+        displaySaveDir.empty() ? L"(未设置)" : displaySaveDir.c_str(),
         r.thumbprint.empty() ? L"(无)" : r.thumbprint.c_str());
 
     MessageBoxW(hwParent, msg, L"续签详情", MB_OK | MB_ICONINFORMATION);
@@ -506,6 +664,13 @@ LRESULT CALLBACK RenewWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
                 // 禁用按钮防止重复点击
                 EnableWindow(GetDlgItem(hw, 101), FALSE);
                 std::wstring renewDomain = records[ri].domain;
+                {
+                    extern std::wstring g_IniPath;
+                    wchar_t iniBuf[2048];
+                    GetPrivateProfileStringW(L"SSLClaw", L"SaveDir", L"", iniBuf, 2048, g_IniPath.c_str());
+                    std::wstring mainSaveDir(iniBuf);
+                    if (!mainSaveDir.empty()) records[ri].saveDir = mainSaveDir;
+                }
                 std::thread([hw, record = records[ri]]() mutable {
                     bool ok = PerformRenewalWithRetry(record);
                     if (ok) AddOrUpdateRenewal(record);
@@ -628,6 +793,11 @@ LRESULT CALLBACK RenewWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         }
         wchar_t buf[64]; swprintf_s(buf, L"共 %d 个续签记录", idx);
         SetWindowTextW(hSt, buf);
+
+        // 检测本地 Web 服务器并显示在右侧
+        std::wstring ws = DetectWebServer();
+        HWND hWs = GetDlgItem(hw, 107);
+        if (hWs) SetWindowTextW(hWs, ws.empty() ? L"未检测到 Web 服务器" : ws.c_str());
     } else if (msg == WM_NOTIFY) {
         NMHDR* pnm = (NMHDR*)lp;
         if (pnm->idFrom == 100 && pnm->code == NM_DBLCLK) {
@@ -699,6 +869,8 @@ HWND g_hWebRoot = NULL;
 HWND g_hBtnWebRootBrowse = NULL;
 HWND g_hBtnWebRootOpen = NULL;
 HWND g_hCA = NULL;       // CA 名称文本
+HWND g_hCAEnv = NULL;    // CA 环境选择(生产/测试)
+int g_CAEnvIndex = 0;    // 0=生产 1=测试
 HWND g_hCAInd = NULL;    // CA 连接指示灯
 HWND g_hCAStatus = NULL; // CA 状态文字
 HWND g_hWildcard = NULL; // 通配符复选框
@@ -719,38 +891,38 @@ std::wstring g_IniPath;
 // 验证步骤提示(避免 main.cpp 与 ssl_ui.cpp 重复)
 void ShowVerifySteps(int vm) {
     if (vm == 0) {
-        Log(L"HTTP-01 验证步骤:");
-        Log(L"1. 填写域名");
-        Log(L"2. 填写邮箱(可选填,用于接收到期提醒)");
-        Log(L"3. 点击\"申请证书\"");
-        Log(L"4. 若本机80端口空闲,自动启动临时验证服务器");
-        Log(L"5. 若80端口被占用(Web服务器运行中),需填写网站目录(即 index.html 所在文件夹)");
-        Log(L"6. CA 完成验证后自动签发证书");
-        Log(L"");
-        Log(L"说明: 验证时域名 A 记录需指向本机");
+        LogUI(L"HTTP-01 验证步骤:");
+        LogUI(L"1. 填写域名");
+        LogUI(L"2. 填写邮箱(可选填,用于接收到期提醒)");
+        LogUI(L"3. 点击\"申请证书\"");
+        LogUI(L"4. 若本机80端口空闲,自动启动临时验证服务器");
+        LogUI(L"5. 若80端口被占用(Web服务器运行中),需填写网站目录(即 index.html 所在文件夹)");
+        LogUI(L"6. CA 完成验证后自动签发证书");
+        LogUI(L"");
+        LogUI(L"说明: 验证时域名 A 记录需指向本机");
     } else {
-        Log(L"DNS-01 验证步骤:");
-        Log(L"");
-        Log(L"【方式一】DNS API 自动化（推荐）:");
-        Log(L"1. 填写域名和邮箱");
-        Log(L"2. 点击「DNS API 配置」按钮");
-        Log(L"3. 选择 DNS 提供商（阿里云/腾讯云/Cloudflare）");
-        Log(L"4. 填入 API 密钥并验证（点击教程查看获取方法）");
-        Log(L"5. 点击「申请证书」，工具自动添加 TXT 记录并验证");
-        Log(L"");
-        Log(L"【方式二】手动添加 TXT 记录:");
-        Log(L"1. 填写域名和邮箱");
-        Log(L"2. 点击「申请证书」，日志栏显示 TXT 记录值");
-        Log(L"3. 登录域名 DNS 管理后台");
-        Log(L"4. 添加 DNS TXT 记录:");
-        Log(L"   主机记录: _acme-challenge");
-        Log(L"   记录类型: TXT");
-        Log(L"   记录值:  日志栏显示的值(区分大小写)");
-        Log(L"5. 等待 DNS 记录生效(通常需数分钟)");
-        Log(L"6. 点击「继续验证」按钮");
-        Log(L"");
-        Log(L"说明: DNS API 自动化支持通配符证书(*.域名)和自动续签");
-        Log(L"      手动模式不支持自动续签，证书到期需手动重新申请");
+        LogUI(L"DNS-01 验证步骤:");
+        LogUI(L"");
+        LogUI(L"【方式一】DNS API 自动化（推荐）:");
+        LogUI(L"1. 填写域名和邮箱");
+        LogUI(L"2. 点击「DNS API 配置」按钮");
+        LogUI(L"3. 选择 DNS 提供商（阿里云/腾讯云/Cloudflare）");
+        LogUI(L"4. 填入 API 密钥并验证（点击教程查看获取方法）");
+        LogUI(L"5. 点击「申请证书」，工具自动添加 TXT 记录并验证");
+        LogUI(L"");
+        LogUI(L"【方式二】手动添加 TXT 记录:");
+        LogUI(L"1. 填写域名和邮箱");
+        LogUI(L"2. 点击「申请证书」，日志栏显示 TXT 记录值");
+        LogUI(L"3. 登录域名 DNS 管理后台");
+        LogUI(L"4. 添加 DNS TXT 记录:");
+        LogUI(L"   主机记录: _acme-challenge");
+        LogUI(L"   记录类型: TXT");
+        LogUI(L"   记录值:  日志栏显示的值(区分大小写)");
+        LogUI(L"5. 等待 DNS 记录生效(通常需数分钟)");
+        LogUI(L"6. 点击「继续验证」按钮");
+        LogUI(L"");
+        LogUI(L"说明: DNS API 自动化支持通配符证书(*.域名)和自动续签");
+        LogUI(L"      手动模式不支持自动续签，证书到期需手动重新申请");
     }
 }
 
@@ -761,9 +933,13 @@ void LogToFile(const wchar_t* msg) {
     HANDLE h = CreateFileW(g_LogFilePath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    if (GetFileSize(h, NULL) == 0) {
+        static const BYTE bom[2] = { 0xFF, 0xFE };
+        WriteFile(h, bom, 2, &written, NULL);
+    }
     SYSTEMTIME st; GetLocalTime(&st);
     wchar_t prefix[64]; swprintf_s(prefix, L"[%04d-%02d-%02d %02d:%02d:%02d] ", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    DWORD written = 0;
     WriteFile(h, prefix, (DWORD)wcslen(prefix) * sizeof(wchar_t), &written, NULL);
     WriteFile(h, msg, (DWORD)wcslen(msg) * sizeof(wchar_t), &written, NULL);
     const wchar_t* crlf = L"\r\n";
@@ -775,24 +951,102 @@ void Log(const wchar_t* fmt, ...) {
     wchar_t buf[4096]; va_list va; va_start(va, fmt);
     _vsnwprintf_s(buf, sizeof(buf) / sizeof(wchar_t), fmt, va); va_end(va);
     LogToFile(buf);
-    if (!g_hLog) return;
+    if (!g_hLog || !IsWindow(g_hLog)) return;
+    if (GetCurrentThreadId() != GetWindowThreadProcessId(g_hLog, NULL)) {
+        std::wstring* pMsg = new std::wstring(buf);
+        PostMessageW(g_hWnd, WM_LOG_MSG, 0, (LPARAM)pMsg);
+        return;
+    }
+    InitLogCs();
+    EnterCriticalSection(&g_LogCs);
     int len = GetWindowTextLengthW(g_hLog);
+    if (len > 200000) {
+        SetWindowTextW(g_hLog, L"...(日志过长，已截断)\r\n");
+        len = 0;
+    }
     if (len > 0) {
         SendMessageW(g_hLog, EM_SETSEL, len, len);
-        std::wstring msg = buf;
-        msg += L"\r\n";
+        std::wstring msg = buf; msg += L"\r\n";
         SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)msg.c_str());
     } else {
-        std::wstring msg = buf;
-        msg += L"\r\n";
+        std::wstring msg = buf; msg += L"\r\n";
         SetWindowTextW(g_hLog, msg.c_str());
         SendMessageW(g_hLog, EM_SETSEL, msg.size(), msg.size());
     }
     if (g_AutoScroll) SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
+    LeaveCriticalSection(&g_LogCs);
+}
+
+// 仅显示到UI不写日志文件
+void LogUI(const wchar_t* fmt, ...) {
+    wchar_t buf[4096]; va_list va; va_start(va, fmt);
+    _vsnwprintf_s(buf, sizeof(buf) / sizeof(wchar_t), fmt, va); va_end(va);
+    if (!g_hLog || !IsWindow(g_hLog)) return;
+    if (GetCurrentThreadId() != GetWindowThreadProcessId(g_hLog, NULL)) {
+        std::wstring* pMsg = new std::wstring(buf);
+        PostMessageW(g_hWnd, WM_LOG_MSG, 0, (LPARAM)pMsg);
+        return;
+    }
+    InitLogCs();
+    EnterCriticalSection(&g_LogCs);
+    int len = GetWindowTextLengthW(g_hLog);
+    if (len > 200000) {
+        SetWindowTextW(g_hLog, L"...(日志过长，已截断)\r\n");
+        len = 0;
+    }
+    if (len > 0) {
+        SendMessageW(g_hLog, EM_SETSEL, len, len);
+        std::wstring msg = buf; msg += L"\r\n";
+        SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)msg.c_str());
+    } else {
+        std::wstring msg = buf; msg += L"\r\n";
+        SetWindowTextW(g_hLog, msg.c_str());
+        SendMessageW(g_hLog, EM_SETSEL, msg.size(), msg.size());
+    }
+    if (g_AutoScroll) SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
+    LeaveCriticalSection(&g_LogCs);
 }
 
 // 设置状态栏
 void SetStatus(const wchar_t* t) { SetWindowTextW(g_hStatus, t); }
+
+void SafeSetStatus(const wchar_t* t) {
+    if (!g_hWnd) return;
+    if (GetCurrentThreadId() == GetWindowThreadProcessId(g_hWnd, NULL)) {
+        SetWindowTextW(g_hStatus, t);
+        return;
+    }
+    std::wstring* p = new std::wstring(t);
+    PostMessageW(g_hWnd, WM_SAFE_SETSTATUS, 0, (LPARAM)p);
+}
+
+void SafeEnableWindow(HWND h, BOOL enable) {
+    if (!h || !g_hWnd) return;
+    if (GetCurrentThreadId() == GetWindowThreadProcessId(g_hWnd, NULL)) {
+        EnableWindow(h, enable);
+        return;
+    }
+    PostMessageW(g_hWnd, WM_SAFE_ENABLE, (WPARAM)h, enable ? 1 : 0);
+}
+
+void SafeSetWindowText(HWND h, const wchar_t* t) {
+    if (!h || !g_hWnd) return;
+    if (GetCurrentThreadId() == GetWindowThreadProcessId(g_hWnd, NULL)) {
+        SetWindowTextW(h, t);
+        return;
+    }
+    std::wstring* p = new std::wstring(t);
+    PostMessageW(g_hWnd, WM_SAFE_SETTEXT, (WPARAM)h, (LPARAM)p);
+}
+
+void SafeInvalidateRect(HWND h) {
+    if (!h || !g_hWnd) return;
+    if (GetCurrentThreadId() == GetWindowThreadProcessId(g_hWnd, NULL)) {
+        InvalidateRect(h, NULL, TRUE);
+        return;
+    }
+    PostMessageW(g_hWnd, WM_SAFE_INVALIDATE, (WPARAM)h, 0);
+}
 
 // 根据验证模式显示/隐藏网站根目录行及通配符选项
 void SyncWebRootVis() {
@@ -930,6 +1184,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SendMessageW(GetDlgItem(h, 29), WM_SETFONT, (WPARAM)f, 0);
         g_hCA = CreateWindowW(L"STATIC", L"Let's Encrypt", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, 0, 0, 0, 0, h, 0, 0, 0);
         SendMessageW(g_hCA, WM_SETFONT, (WPARAM)f, 0);
+        g_hCAEnv = CreateWindowW(L"STATIC", L"[正式环境]", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_NOTIFY, 0, 0, 0, 0, h, (HMENU)34, 0, 0);
+        SendMessageW(g_hCAEnv, WM_SETFONT, (WPARAM)f, 0);
         g_hCAStatus = CreateWindowW(L"STATIC", L"检测中...", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, 0, 0, 0, 0, h, (HMENU)31, 0, 0);
         SendMessageW(g_hCAStatus, WM_SETFONT, (WPARAM)f, 0);
         g_hCAInd = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_OWNERDRAW, 0, 0, 0, 0, h, (HMENU)30, 0, 0);
@@ -939,8 +1195,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             DWORD status = 0;
             HttpJson(L"https://acme-staging-v02.api.letsencrypt.org/directory", L"GET", NULL, 0, NULL, NULL, &status);
             g_caStatus = (status == 200) ? 1 : 2;
-            if (g_hCAStatus) SetWindowTextW(g_hCAStatus, g_caStatus == 1 ? L"已连接" : L"不可达");
-            if (g_hCAInd) InvalidateRect(g_hCAInd, NULL, TRUE);
+            SafeSetWindowText(g_hCAStatus, g_caStatus == 1 ? L"已连接" : L"不可达");
+            SafeInvalidateRect(g_hCAInd);
             return 0;
         }, 0, 0, 0);
         // CA 检测线程: lambda 已包含 return 0
@@ -1031,11 +1287,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     g_ipIndex = 0;
                     wchar_t display[128];
                     swprintf_s(display, L"本机IP: %s", g_ipList[0].c_str());
-                    SetWindowTextW(g_hIP, display);
+                    SafeSetWindowText(g_hIP, display);
                     if (g_ipList.size() > 1)
                         SetTimer(h, IP_TIMER_ID, 5000, NULL);
                 } else {
-                    SetWindowTextW(g_hIP, L"本机IP: --");
+                    SafeSetWindowText(g_hIP, L"本机IP: --");
                 }
             }
         }
@@ -1051,9 +1307,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int IX = LM + LW + G, IW = W - IX - RM;
         if (IW < 100) IW = 100;  // 防御性保护
         int y = 12;
-        // CA机构行(标签 + 文本 + 状态文字 + 指示灯)- 第一行
+        // CA机构行(标签 + 文本 + 环境标签 + 状态文字 + 指示灯)- 第一行
         SetWindowPos(GetDlgItem(h, 29), 0, LM + 10, y, LW, RH, 4);
-        SetWindowPos(g_hCA, 0, IX + 10, y, IW - 82, RH, 4);
+        int caTextW = 100;
+        SetWindowPos(g_hCA, 0, IX + 10, y, caTextW, RH, 4);
+        SetWindowPos(g_hCAEnv, 0, IX + 5 + caTextW, y, 60, RH, 4);
         SetWindowPos(g_hCAStatus, 0, IX + IW - 70, y, 48, RH, 4);
         SetWindowPos(g_hCAInd, 0, IX + IW - 20, y + 5, 16, 16, 4);
         y += RH + RG;
@@ -1164,6 +1422,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         else if (LOWORD(w) == 33) {
             ShowDnsConfigDialog(h);
         }
+        else if (LOWORD(w) == 34) {
+            static DWORD lastEnvTick = 0;
+            DWORD now = GetTickCount();
+            if (now - lastEnvTick < 500) break;
+            lastEnvTick = now;
+            g_CAEnvIndex = 1 - g_CAEnvIndex;
+            SetWindowTextW(g_hCAEnv, g_CAEnvIndex == 1 ? L"[测试环境]" : L"[正式环境]");
+        }
         else if (LOWORD(w) == 5) {
             // 打开证书续签窗口
             wchar_t dt[MAX_PATH]; GetWindowTextW(g_hSaveDirEdit, dt, MAX_PATH);
@@ -1253,12 +1519,18 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, btnY, bw, btnH, g_RenewWnd, (HMENU)103, 0, 0);
             SendMessageW(GetDlgItem(g_RenewWnd, 103), WM_SETFONT, (WPARAM)rf, 0);
 
-            // 状态栏 - 紧贴底部
+            // 状态栏 - 紧贴底部，左边记录数，右边 Web 服务器检测
             int stY = btnY + btnH + 8;
+            int stTotalW = cw - padX*2;
+            int leftW = 150;  // 左边“共 N 个续签记录”
             CreateWindowW(L"STATIC", L"",
                 WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-                padX, stY, cw - padX*2, statusH, g_RenewWnd, (HMENU)106, 0, 0);
+                padX, stY, leftW, statusH, g_RenewWnd, (HMENU)106, 0, 0);
             SendMessageW(GetDlgItem(g_RenewWnd, 106), WM_SETFONT, (WPARAM)rf, 0);
+            CreateWindowW(L"STATIC", L"",
+                WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
+                padX + leftW, stY, stTotalW - leftW, statusH, g_RenewWnd, (HMENU)107, 0, 0);
+            SendMessageW(GetDlgItem(g_RenewWnd, 107), WM_SETFONT, (WPARAM)rf, 0);
 
             // 子类化窗口过程（不能用 lambda，MSVC 不支持 lambda 转 WNDPROC）
             g_OrigRenewProc = (WNDPROC)SetWindowLongPtrW(g_RenewWnd, GWLP_WNDPROC,
@@ -1269,10 +1541,15 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SendMessageW(g_RenewWnd, WM_USER+1, 0, 0);
         }
         else if (HIWORD(w) == CBN_SELCHANGE && (HWND)l == g_hVerifyMode) {
+            static DWORD lastSwitchTick = 0;
+            DWORD now = GetTickCount();
+            if (now - lastSwitchTick < 300) break;
+            lastSwitchTick = now;
             SyncWebRootVis();
             g_AutoScroll = false;
             SetWindowTextW(g_hLog, L"");
             ShowVerifySteps((int)SendMessageW(g_hVerifyMode, CB_GETCURSEL, 0, 0));
+            SendMessageW(g_hLog, EM_SETSEL, 0, 0);
             SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
         }
         else if ((HWND)l == g_hIP && HIWORD(w) == 0) {
@@ -1301,7 +1578,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             tc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_ENABLE_HYPERLINKS;
             tc.pszWindowTitle = L"关于 SSLClaw";
             tc.pszMainIcon = TD_INFORMATION_ICON;
-            tc.pszMainInstruction = L"SSLClaw v1.1";
+            tc.pszMainInstruction = L"SSLClaw v1.3";
             tc.pszContent = L"Windows SSL 证书管理工具\n基于 ACME 协议自动申请和续签 Let's Encrypt 证书\n\n作者:DiskClaw\n<a href=\"https://github.com/DiskClaw/SSLClaw\">https://github.com/DiskClaw/SSLClaw</a>";
             tc.pfCallback = cb;
             TaskDialogIndirect(&tc, NULL, NULL, NULL);
@@ -1373,9 +1650,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetBkColor(dc, RGB(245, 245, 245));
         HWND ctrl = (HWND)l;
         if (ctrl == g_hCAStatus) {
-            if (g_caStatus == 1) SetTextColor(dc, RGB(0, 150, 60));      // 绿色文字
-            else if (g_caStatus == 2) SetTextColor(dc, RGB(200, 40, 40));  // 红色文字
-            else SetTextColor(dc, RGB(120, 120, 120));                     // 灰色文字
+            if (g_caStatus == 1) SetTextColor(dc, RGB(0, 150, 60));
+            else if (g_caStatus == 2) SetTextColor(dc, RGB(200, 40, 40));
+            else SetTextColor(dc, RGB(120, 120, 120));
+        } else if (ctrl == g_hCAEnv) {
+            SetTextColor(dc, g_CAEnvIndex == 1 ? RGB(220, 120, 0) : RGB(100, 100, 100));
         } else {
             SetTextColor(dc, RGB(0, 0, 0));
         }
@@ -1403,6 +1682,58 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             ShowWindow(h, SW_HIDE);
         }
+        return 0;
+    }
+    case WM_LOG_MSG: {
+        std::wstring* pMsg = (std::wstring*)l;
+        if (pMsg && g_hLog && IsWindow(g_hLog)) {
+            InitLogCs();
+            EnterCriticalSection(&g_LogCs);
+            int len = GetWindowTextLengthW(g_hLog);
+            if (len > 200000) {
+                SetWindowTextW(g_hLog, L"...(日志过长，已截断)\r\n");
+                len = 0;
+            }
+            if (len > 0) {
+                SendMessageW(g_hLog, EM_SETSEL, len, len);
+                std::wstring msg = *pMsg + L"\r\n";
+                SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)msg.c_str());
+            } else {
+                std::wstring msg = *pMsg + L"\r\n";
+                SetWindowTextW(g_hLog, msg.c_str());
+                SendMessageW(g_hLog, EM_SETSEL, msg.size(), msg.size());
+            }
+            if (g_AutoScroll) SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
+            LeaveCriticalSection(&g_LogCs);
+        }
+        delete pMsg;
+        return 0;
+    }
+    case WM_SAFE_SETSTATUS: {
+        std::wstring* p = (std::wstring*)l;
+        if (p && g_hStatus && IsWindow(g_hStatus))
+            SetWindowTextW(g_hStatus, p->c_str());
+        delete p;
+        return 0;
+    }
+    case WM_SAFE_ENABLE: {
+        HWND hCtrl = (HWND)w;
+        if (hCtrl && IsWindow(hCtrl))
+            EnableWindow(hCtrl, l ? TRUE : FALSE);
+        return 0;
+    }
+    case WM_SAFE_SETTEXT: {
+        HWND hCtrl = (HWND)w;
+        std::wstring* p = (std::wstring*)l;
+        if (hCtrl && IsWindow(hCtrl) && p)
+            SetWindowTextW(hCtrl, p->c_str());
+        delete p;
+        return 0;
+    }
+    case WM_SAFE_INVALIDATE: {
+        HWND hCtrl = (HWND)w;
+        if (hCtrl && IsWindow(hCtrl))
+            InvalidateRect(hCtrl, NULL, TRUE);
         return 0;
     }
     case WM_TRAY: {
@@ -1451,9 +1782,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 保存通配符复选框状态
         int wc = (int)SendMessageW(g_hWildcard, BM_GETCHECK, 0, 0);
         WritePrivateProfileStringW(L"SSLClaw", L"Wildcard", wc ? L"1" : L"0", g_IniPath.c_str());
-        // CA 固定 Let's Encrypt (index 0)
-        WritePrivateProfileStringW(L"SSLClaw", L"CA", L"0", g_IniPath.c_str());
+        // CA 固定 Let's Encrypt，环境不持久化(每次启动默认生产)
         DeleteObject((HFONT)GetPropW(h, L"F")); DeleteObject((HFONT)GetPropW(h, L"FB"));
+        if (g_LogCsInit) DeleteCriticalSection(&g_LogCs);
         PostQuitMessage(0); break;
     }
     default: {

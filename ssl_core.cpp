@@ -55,6 +55,7 @@ extern bool DnsPreValidateAuthoritative(const std::wstring& queryName, const std
 
 // 全局状态
 extern void Log(const wchar_t* fmt, ...);
+extern void LogUI(const wchar_t* fmt, ...);
 BCRYPT_KEY_HANDLE g_AccKey = NULL;
 std::string g_AccPubB64, g_AccExpB64;
 std::string g_AccURL;
@@ -87,9 +88,14 @@ const wchar_t* GetAccountKeySuffix() {
 
 // ── 证书申请线程（UI 驱动） ──
 extern void SetStatus(const wchar_t* t);
+extern void SafeSetStatus(const wchar_t* t);
+extern void SafeEnableWindow(HWND h, BOOL enable);
+extern void SafeSetWindowText(HWND h, const wchar_t* t);
 extern HWND g_hWnd;
 extern HWND g_hDomain, g_hEmail, g_hSaveDirEdit, g_hServer, g_hBtnApply, g_hVerifyMode, g_hDaysEdit;
 extern HWND g_hWildcard;
+extern HWND g_hCAEnv;
+extern volatile LONG g_AcmeBusyFlag;
 extern std::wstring g_SaveDir;
 extern int g_DnsProvider;
 extern std::wstring g_DnsApiId;
@@ -97,24 +103,28 @@ extern std::wstring g_DnsApiSecret;
 extern void LoadDnsConfigForDomain(const std::wstring& domain);
 
 static unsigned ApplyThreadInner() {
+    if (InterlockedCompareExchange(&g_AcmeBusyFlag, 1, 0) != 0) {
+        Log(L"[错误] ACME 操作进行中，请稍后再试");
+        SafeSetStatus(L"ACME 忙碌"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+    }
     const int MAX_DOMAIN_LEN = 256;
     wchar_t td[MAX_DOMAIN_LEN]; 
     int domainLen = GetWindowTextW(g_hDomain, td, MAX_DOMAIN_LEN);
     if (domainLen >= MAX_DOMAIN_LEN - 1) {
-        SetStatus(L"域名过长(最大255字符)");
-        EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+        SafeSetStatus(L"域名过长(最大255字符)");
+        SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
     }
     wchar_t* p = td; while (*p == L' ') p++; std::wstring wd = p;
     while (!wd.empty() && wd.back() == L' ') wd.pop_back();
-    if (wd.empty()) { SetStatus(L"域名不能为空"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+    if (wd.empty()) { SafeSetStatus(L"域名不能为空"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
 
     int verifyMode = (int)SendMessageW(g_hVerifyMode, CB_GETCURSEL, 0, 0);
     bool isWild = g_hWildcard && (SendMessageW(g_hWildcard, BM_GETCHECK, 0, 0) == BST_CHECKED);
     if (isWild) {
         if (verifyMode == 0) {
             Log(L"[错误] 通配符证书仅支持 DNS-01 验证方式");
-            SetStatus(L"通配符需 DNS-01");
-            EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+            SafeSetStatus(L"通配符需 DNS-01");
+            SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
         }
         if (wd.size() < 2 || wd[0] != L'*') wd = L"*." + wd;
     }
@@ -125,7 +135,7 @@ static unsigned ApplyThreadInner() {
 
     wchar_t dtx[MAX_PATH]; GetWindowTextW(g_hSaveDirEdit, dtx, MAX_PATH);
     if (dtx[0]) g_SaveDir = dtx;
-    if (g_SaveDir.empty()) { SetStatus(L"保存目录不能为空"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+    if (g_SaveDir.empty()) { SafeSetStatus(L"保存目录不能为空"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
 
     std::wstring nt = wd;
     if (nt.size() >= 2 && nt[0] == L'*' && nt[1] == L'.') nt = L"wildcard." + nt.substr(2);
@@ -138,11 +148,12 @@ static unsigned ApplyThreadInner() {
     srv = sn[si < 4 ? si : 3];
 
     std::wstring verifyName = verifyMode == 0 ? L"HTTP-01" : L"DNS-01";
-    g_CAIndex = 0;
-    const wchar_t* caName = L"Let's Encrypt";
-    EnableWindow(g_hBtnApply, FALSE);
-    EnableWindow(g_hDaysEdit, FALSE);
-    SetStatus(L"正在申请证书...");
+    extern int g_CAEnvIndex;
+    g_CAIndex = g_CAEnvIndex;
+    const wchar_t* caName = g_CAIndex == 1 ? L"Let's Encrypt (Staging)" : L"Let's Encrypt";
+    SafeEnableWindow(g_hBtnApply, FALSE);
+    SafeEnableWindow(g_hDaysEdit, FALSE);
+    SafeSetStatus(L"正在申请证书...");
     Log(L"----------------------------------------");
     Log(L"  域名: %s", wd.c_str());
     if (!email.empty()) Log(L"  邮箱: %s", email.c_str());
@@ -154,14 +165,14 @@ static unsigned ApplyThreadInner() {
     Log(L"----------------------------------------");
 
     // Step 1: 加载账户密钥
-    SetStatus(L"加载帐户密钥...");
+    SafeSetStatus(L"加载帐户密钥...");
     Log(L"Step 1: 加载 ACME 帐户密钥...");
     std::string keyPath = W2A(g_SaveDir + L"\\acme_account" + GetAccountKeySuffix() + L".key");
     if (!LoadAccountKey(keyPath)) {
         Log(L"  未找到现有密钥，生成新密钥...");
         if (!MakeAccountKey()) {
-            Log(L"[错误] 密钥生成失败"); SetStatus(L"失败");
-            EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+            Log(L"[错误] 密钥生成失败"); SafeSetStatus(L"失败");
+            SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
         }
         SavePKEY(keyPath);
         Log(L"  新密钥已保存");
@@ -171,19 +182,19 @@ static unsigned ApplyThreadInner() {
     }
 
     // Step 2: 获取 ACME 目录
-    SetStatus(L"连接 CA 服务器...");
+    SafeSetStatus(L"连接 CA 服务器...");
     Log(L"Step 2: 获取 ACME 目录 (%s)...", caName);
     g_AcmeNonce.clear();
     std::string dir = HttpJson(GetAcmeDirectory(), L"GET", NULL, 0, &g_AcmeNonce);
     std::string newAcct = JsonStr(dir, "newAccount");
     std::string newOrder = JsonStr(dir, "newOrder");
     if (dir.empty()) {
-        Log(L"[错误] 无法连接 ACME 服务器"); SetStatus(L"失败");
-        EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+        Log(L"[错误] 无法连接 ACME 服务器"); SafeSetStatus(L"失败");
+        SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
     }
     if (newAcct.empty() || newOrder.empty()) {
-        Log(L"[错误] 无法解析 ACME 目录响应"); SetStatus(L"失败");
-        EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+        Log(L"[错误] 无法解析 ACME 目录响应"); SafeSetStatus(L"失败");
+        SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
     }
     auto getNonce = [&]() {
         g_AcmeNonce.clear();
@@ -196,7 +207,7 @@ static unsigned ApplyThreadInner() {
     if (g_AcmeNonce.empty()) getNonce();
 
     // Step 3: 注册 ACME 账户
-    SetStatus(L"注册 ACME 帐户...");
+    SafeSetStatus(L"注册 ACME 帐户...");
     Log(L"Step 3: 注册帐户...");
     {
         std::string regBody = "{\"termsOfServiceAgreed\":true";
@@ -219,7 +230,7 @@ static unsigned ApplyThreadInner() {
         if (!regOK) {
             Log(L"[错误] 帐户注册失败 (HTTP %d)", regHttp);
             Log(L"  响应: %s", A2W(regResp.substr(0, 500)).c_str());
-            SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+            SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
         }
         g_AccURL = loc;
         std::string regStatus = JsonStr(regResp, "status");
@@ -227,7 +238,7 @@ static unsigned ApplyThreadInner() {
     }
 
     // Step 4: 创建订单
-    SetStatus(L"创建订单...");
+    SafeSetStatus(L"创建订单...");
     Log(L"Step 4: 创建订单...");
     std::string orderUrl, authzUrl, finalizeUrl, certUrl;
     std::string domainA = W2A(wd);
@@ -243,7 +254,7 @@ static unsigned ApplyThreadInner() {
         if (order.empty()) {
             Log(L"[错误] 订单创建失败 (HTTP %d)", orderHttpCode);
             if (orderHttpCode == 429) Log(L"  速率限制: 每周最多签发 50 张证书");
-            SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+            SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
         }
         std::string orderStatus = JsonStr(order, "status");
         Log(L"  订单状态: %s", A2W(orderStatus).c_str());
@@ -255,13 +266,13 @@ static unsigned ApplyThreadInner() {
             std::string rateDetail = JsonStr(order, "detail");
             Log(L"[错误] Let's Encrypt 速率限制: %s", A2W(rateDetail.empty() ? order.substr(0, 300) : rateDetail).c_str());
             Log(L"  提示: 同一域名每周最多签发 5 张证书，请稍后重试");
-            SetStatus(L"速率限制"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+            SafeSetStatus(L"速率限制"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
         }
 
         if (order.empty() || orderHttpCode >= 400) {
             std::string errDetail = JsonStr(order, "detail");
             Log(L"[错误] 订单创建失败 (HTTP %d): %s", orderHttpCode, A2W(errDetail.empty() ? order.substr(0, 300) : errDetail).c_str());
-            SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+            SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
         }
 
         if (orderStatus == "ready") {
@@ -271,26 +282,26 @@ static unsigned ApplyThreadInner() {
             // 解析 authorizations 数组，用 JsonStr 逻辑提取第一个 URL
             size_t aPos = order.find("\"authorizations\"");
             if (aPos == std::string::npos) {
-                Log(L"[错误] 订单响应缺少 authorizations 字段"); SetStatus(L"失败");
-                EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+                Log(L"[错误] 订单响应缺少 authorizations 字段"); SafeSetStatus(L"失败");
+                SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
             }
             // 查找数组开始
             size_t arrStart = order.find('[', aPos);
             if (arrStart == std::string::npos) {
-                Log(L"[错误] authorizations 不是数组"); SetStatus(L"失败");
-                EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+                Log(L"[错误] authorizations 不是数组"); SafeSetStatus(L"失败");
+                SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
             }
             // 查找第一个引号
             size_t quoteStart = order.find('"', arrStart);
             if (quoteStart == std::string::npos) {
-                Log(L"[错误] authorizations 数组为空"); SetStatus(L"失败");
-                EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+                Log(L"[错误] authorizations 数组为空"); SafeSetStatus(L"失败");
+                SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
             }
             quoteStart++;
             size_t quoteEnd = order.find('"', quoteStart);
             if (quoteEnd == std::string::npos) {
-                Log(L"[错误] authorizations URL 解析失败"); SetStatus(L"失败");
-                EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+                Log(L"[错误] authorizations URL 解析失败"); SafeSetStatus(L"失败");
+                SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
             }
             authzUrl = order.substr(quoteStart, quoteEnd - quoteStart);
             finalizeUrl = JsonStr(order, "finalize");
@@ -308,10 +319,10 @@ static unsigned ApplyThreadInner() {
         baseDomain = baseDomain.substr(2);
 
     if (!skipChallenge) {
-        SetStatus(L"获取授权...");
+        SafeSetStatus(L"获取授权...");
         Log(L"Step 5: 获取域名授权...");
         std::string authz = AcmePost(authzUrl, "", g_AcmeNonce, false);
-        if (authz.empty()) { Log(L"[错误] 授权获取失败"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+        if (authz.empty()) { Log(L"[错误] 授权获取失败"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
         if (authz.find("\"pending\"") == std::string::npos && authz.find("\"valid\"") == std::string::npos && authz.find("\"ready\"") == std::string::npos) {
             Log(L"  [调试] 授权响应: %s", A2W(authz.substr(0, 500)).c_str());
         }
@@ -322,38 +333,38 @@ static unsigned ApplyThreadInner() {
             // HTTP-01
             size_t cPos = authz.find("\"http-01\"");
             if (cPos == std::string::npos) cPos = authz.find("\"type\":\"http-01\"");
-            if (cPos == std::string::npos) { Log(L"[错误] 未找到 HTTP-01 挑战"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
-            cPos = authz.find("\"url\"", cPos); if (cPos == std::string::npos) { Log(L"[错误] 挑战无 url"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+            if (cPos == std::string::npos) { Log(L"[错误] 未找到 HTTP-01 挑战"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+            cPos = authz.find("\"url\"", cPos); if (cPos == std::string::npos) { Log(L"[错误] 挑战无 url"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
             cPos = authz.find(":", cPos); cPos = authz.find("\"", cPos) + 1; size_t cEnd = authz.find("\"", cPos);
             challUrl = authz.substr(cPos, cEnd - cPos);
-            size_t tPos = authz.find("\"token\"", cPos); if (tPos == std::string::npos) { Log(L"[错误] 挑战无 token"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+            size_t tPos = authz.find("\"token\"", cPos); if (tPos == std::string::npos) { Log(L"[错误] 挑战无 token"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
             tPos = authz.find(":", tPos); tPos = authz.find("\"", tPos) + 1; size_t tEnd = authz.find("\"", tPos);
             token = authz.substr(tPos, tEnd - tPos);
             keyAuth = token + "." + AccThumbprint();
 
             bool port80Free = IsPort80Free();
             if (port80Free) {
-                SetStatus(L"启动验证服务器...");
+                SafeSetStatus(L"启动验证服务器...");
                 Log(L"Step 6: 80 端口空闲，启动临时验证服务器...");
                 if (!StartTempHttpServer(token, keyAuth)) {
-                    Log(L"[错误] 临时验证服务器启动失败"); SetStatus(L"失败");
-                    EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+                    Log(L"[错误] 临时验证服务器启动失败"); SafeSetStatus(L"失败");
+                    SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
                 }
                 useTempServer = true;
                 Log(L"  临时验证服务器已启动（监听80端口）");
             } else {
-                SetStatus(L"写入验证文件...");
+                SafeSetStatus(L"写入验证文件...");
                 Log(L"Step 6: Web 服务器运行中，写入验证文件...");
-                if (g_WebRoot.empty()) { Log(L"[错误] 需填写网站目录"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+                if (g_WebRoot.empty()) { Log(L"[错误] 需填写网站目录"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
                 std::wstring challDir = g_WebRoot + L"\\.well-known\\acme-challenge";
                 challFile = challDir + L"\\" + A2W(token);
                 CreateDirectoryW((g_WebRoot + L"\\.well-known").c_str(), NULL);
                 if (!CreateDirectoryW(challDir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-                    Log(L"[错误] 无法创建目录 %s", challDir.c_str()); SetStatus(L"目录创建失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+                    Log(L"[错误] 无法创建目录 %s", challDir.c_str()); SafeSetStatus(L"目录创建失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
                 }
                 {
                     HANDLE hcf = CreateFileW(challFile.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                    if (hcf == INVALID_HANDLE_VALUE) { Log(L"[错误] 无法写入验证文件 %s", challFile.c_str()); SetStatus(L"写入失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+                    if (hcf == INVALID_HANDLE_VALUE) { Log(L"[错误] 无法写入验证文件 %s", challFile.c_str()); SafeSetStatus(L"写入失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
                     DWORD written2 = 0; WriteFile(hcf, keyAuth.data(), (DWORD)keyAuth.size(), &written2, NULL); CloseHandle(hcf);
                 }
                 Log(L"  已写入: .well-known/acme-challenge/%s", A2W(token).c_str());
@@ -362,11 +373,11 @@ static unsigned ApplyThreadInner() {
             // DNS-01
             size_t cPos = authz.find("\"dns-01\"");
             if (cPos == std::string::npos) cPos = authz.find("\"type\":\"dns-01\"");
-            if (cPos == std::string::npos) { Log(L"[错误] 未找到 DNS-01 挑战"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
-            cPos = authz.find("\"url\"", cPos); if (cPos == std::string::npos) { Log(L"[错误] 挑战无 url"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+            if (cPos == std::string::npos) { Log(L"[错误] 未找到 DNS-01 挑战"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+            cPos = authz.find("\"url\"", cPos); if (cPos == std::string::npos) { Log(L"[错误] 挑战无 url"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
             cPos = authz.find(":", cPos); cPos = authz.find("\"", cPos) + 1; size_t cEnd = authz.find("\"", cPos);
             challUrl = authz.substr(cPos, cEnd - cPos);
-            size_t tPos = authz.find("\"token\"", cPos); if (tPos == std::string::npos) { Log(L"[错误] 挑战无 token"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+            size_t tPos = authz.find("\"token\"", cPos); if (tPos == std::string::npos) { Log(L"[错误] 挑战无 token"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
             tPos = authz.find(":", tPos); tPos = authz.find("\"", tPos) + 1; size_t tEnd = authz.find("\"", tPos);
             token = authz.substr(tPos, tEnd - tPos);
             keyAuth = token + "." + AccThumbprint();
@@ -379,25 +390,25 @@ static unsigned ApplyThreadInner() {
 
             if (hasApi) {
             // API 自动模式：自动创建 TXT 记录
-            SetStatus(L"自动创建 TXT 记录...");
+            SafeSetStatus(L"自动创建 TXT 记录...");
             Log(L"Step 6: DNS-01 验证 (API 自动模式 - %s)", g_DnsProvider == 1 ? L"阿里云" : g_DnsProvider == 2 ? L"腾讯云" : L"Cloudflare");
 
             std::wstring zone, subDomain;
             DnsFindZone(g_DnsProvider, g_DnsApiId, g_DnsApiSecret, wQueryName, zone, subDomain);
-            if (zone.empty()) { Log(L"[错误] 无法找到 DNS Zone，请检查 API 配置"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+            if (zone.empty()) { Log(L"[错误] 无法找到 DNS Zone，请检查 API 配置"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
             Log(L"  Zone: %s, 子域: %s", zone.c_str(), subDomain.c_str());
 
             std::wstring dnsErr = DnsCreateTxtRecord(g_DnsProvider, g_DnsApiId, g_DnsApiSecret, zone, subDomain, wChallenge);
-            if (!dnsErr.empty()) { Log(L"[错误] TXT 记录创建失败: %s", dnsErr.c_str()); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+            if (!dnsErr.empty()) { Log(L"[错误] TXT 记录创建失败: %s", dnsErr.c_str()); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
             Log(L"  TXT 记录已自动创建");
             dnsApiZone = zone; dnsApiSubDomain = subDomain; dnsApiCreated = true;
 
-            SetStatus(L"等待 DNS 传播...");
+            SafeSetStatus(L"等待 DNS 传播...");
             Log(L"  等待 DNS 传播 (30秒)...");
             for (int ew = 30; ew > 0; ew -= 5) { Sleep(5000); if (!g_Running) return 0; }
 
             // DNS 权威预验证
-            SetStatus(L"检查 DNS 传播...");
+            SafeSetStatus(L"检查 DNS 传播...");
             bool dnsFound = false;
             if (DnsPreValidateAuthoritative(wQueryName, wChallenge, 5, 10)) {
                 dnsFound = true;
@@ -420,28 +431,28 @@ static unsigned ApplyThreadInner() {
                 }
             }
         } else {
-            // 手工模式：提示用户手动添加 TXT 记录
-            SetStatus(L"请添加 TXT 记录...");
-            Log(L"Step 6: DNS-01 验证 (手工模式)");
-            Log(L"");
-            Log(L"----------------------------------------");
-            Log(L"DNS-01 验证步骤：");
-            Log(L"  1. 登录域名 DNS 管理后台");
-            Log(L"  2. 添加以下 TXT 记录：");
-            Log(L"");
-            Log(L"     主机记录: _acme-challenge");
-            Log(L"     记录类型: TXT");
-            Log(L"     记录值: %s", wChallenge.c_str());
-            if (isWild) Log(L"     完整名称: _acme-challenge.%s", baseDomain.c_str());
-            Log(L"");
-            Log(L"  3. 等待 DNS 记录生效（通常需数分钟）");
-            Log(L"  4. 点击「继续验证」按钮");
-            Log(L"");
-            if (isWild) Log(L"  通配符: TXT 记录添加在根域名 %s 下（非 *.%s）", baseDomain.c_str(), baseDomain.c_str());
-            Log(L"  记录值区分大小写，完整复制");
-            Log(L"  提示: 可在「DNS API 配置」中设置 API 自动创建");
-            Log(L"----------------------------------------");
-            Log(L"");
+             // 手工模式：提示用户手动添加 TXT 记录
+             SafeSetStatus(L"请添加 TXT 记录...");
+             LogUI(L"Step 6: DNS-01 验证 (手工模式)");
+             LogUI(L"");
+             LogUI(L"----------------------------------------");
+             LogUI(L"DNS-01 验证步骤：");
+             LogUI(L"  1. 登录域名 DNS 管理后台");
+             LogUI(L"  2. 添加以下 TXT 记录：");
+             LogUI(L"");
+             LogUI(L"     主机记录: _acme-challenge");
+             LogUI(L"     记录类型: TXT");
+             LogUI(L"     记录值: %s", wChallenge.c_str());
+             if (isWild) LogUI(L"     完整名称: _acme-challenge.%s", baseDomain.c_str());
+             LogUI(L"");
+             LogUI(L"  3. 等待 DNS 记录生效（通常需数分钟）");
+             LogUI(L"  4. 点击「继续验证」按钮");
+             LogUI(L"");
+             if (isWild) LogUI(L"  通配符: TXT 记录添加在根域名 %s 下（非 *.%s）", baseDomain.c_str(), baseDomain.c_str());
+             LogUI(L"  记录值区分大小写，完整复制");
+             LogUI(L"  提示: 可在「DNS API 配置」中设置 API 自动创建");
+             LogUI(L"----------------------------------------");
+             LogUI(L"");
 
             {
                 EnterCriticalSection(&g_cs);
@@ -454,15 +465,15 @@ static unsigned ApplyThreadInner() {
                 LeaveCriticalSection(&g_cs);
                 
                 if (!localDnsReady) {
-                    SetStatus(L"内部错误");
-                    EnableWindow(g_hBtnApply, TRUE);
-                    SetWindowTextW(g_hBtnApply, L"申请证书");
+                    SafeSetStatus(L"内部错误");
+                    SafeEnableWindow(g_hBtnApply, TRUE);
+                    SafeSetWindowText(g_hBtnApply, L"申请证书");
                     return 0;
                 }
                 
-                EnableWindow(g_hBtnApply, TRUE);
-                SetWindowTextW(g_hBtnApply, L"继续验证");
-                SetStatus(L"请添加 TXT 记录后点击「继续验证」");
+                SafeEnableWindow(g_hBtnApply, TRUE);
+                SafeSetWindowText(g_hBtnApply, L"继续验证");
+                SafeSetStatus(L"请添加 TXT 记录后点击「继续验证」");
                 Log(L"  请添加 TXT 记录后点击「继续验证」按钮...");
                 
                 bool shouldExit = false;
@@ -487,16 +498,16 @@ static unsigned ApplyThreadInner() {
                 LeaveCriticalSection(&g_cs);
                 
                 if (shouldExit) {
-                    EnableWindow(g_hBtnApply, TRUE);
-                    SetWindowTextW(g_hBtnApply, L"申请证书");
+                    SafeEnableWindow(g_hBtnApply, TRUE);
+                    SafeSetWindowText(g_hBtnApply, L"申请证书");
                     return 0;
                 }
                 
-                EnableWindow(g_hBtnApply, FALSE);
-                SetWindowTextW(g_hBtnApply, L"申请证书");
+                SafeEnableWindow(g_hBtnApply, FALSE);
+                SafeSetWindowText(g_hBtnApply, L"申请证书");
 
                     // DNS 传播自检
-                    SetStatus(L"检查 DNS 传播...");
+                    SafeSetStatus(L"检查 DNS 传播...");
                     bool dnsFound = false;
                     if (DnsPreValidateAuthoritative(wQueryName, wChallenge, 5, 10)) {
                         dnsFound = true;
@@ -523,7 +534,7 @@ static unsigned ApplyThreadInner() {
         }
 
         // Step 7: 通知 ACME 验证
-        SetStatus(L"验证域名...");
+        SafeSetStatus(L"验证域名...");
         Log(L"Step 7: 请求 ACME 验证...");
         AcmePost(challUrl, "{}", g_AcmeNonce, false);
         Log(L"  已通知验证");
@@ -533,7 +544,18 @@ static unsigned ApplyThreadInner() {
         bool verified = false;
         for (int i = 0; i < (verifyMode == 0 ? 12 : 60); i++) {
             Sleep(5000);
-            std::string check = AcmePost(authzUrl, "", g_AcmeNonce, false);
+            DWORD pollCode = 0;
+            std::string check = AcmePost(authzUrl, "", g_AcmeNonce, false, NULL, &pollCode);
+            if (pollCode >= 400) {
+                std::string errType = JsonStr(check, "type");
+                std::string errDetail = JsonStr(check, "detail");
+                if (errType.find("urn:ietf:params:acme:error:") != std::string::npos) {
+                    Log(L"[错误] ACME 错误 (HTTP %d): %s", pollCode, A2W(errDetail.empty() ? check.substr(0, 200) : errDetail).c_str());
+                } else {
+                    Log(L"[错误] 服务器错误 (HTTP %d): %.200s", pollCode, A2W(check).c_str());
+                }
+                break;
+            }
             std::string authStatus = JsonStr(check, "status");
             if (authStatus == "valid") { verified = true; break; }
             if (authStatus == "invalid") {
@@ -552,7 +574,7 @@ static unsigned ApplyThreadInner() {
             else if (verifyMode == 0 && !challFile.empty()) DeleteFileW(challFile.c_str());
             if (dnsApiCreated) DnsDeleteTxtRecord(g_DnsProvider, g_DnsApiId, g_DnsApiSecret, dnsApiZone, dnsApiSubDomain);
             Log(L"[错误] 域名验证失败");
-            SetStatus(L"验证失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+            SafeSetStatus(L"验证失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
         }
         Log(L"  验证通过");
         if (useTempServer) StopTempHttpServer();
@@ -561,18 +583,18 @@ static unsigned ApplyThreadInner() {
     }
 
     // Step 9: 生成域密钥和 CSR
-    SetStatus(L"生成域密钥和 CSR...");
+    SafeSetStatus(L"生成域密钥和 CSR...");
     Log(L"Step 9: 生成域密钥和 CSR...");
     BCRYPT_ALG_HANDLE ha = NULL;
     NTSTATUS st = BCryptOpenAlgorithmProvider(&ha, BCRYPT_RSA_ALGORITHM, NULL, 0);
-    if (st != 0) { Log(L"[错误] 无法打开算法提供者"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+    if (st != 0) { Log(L"[错误] 无法打开算法提供者"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
     
     BCRYPT_KEY_HANDLE dk = NULL;
     st = BCryptGenerateKeyPair(ha, &dk, 2048, 0);
-    if (st != 0) { BCryptCloseAlgorithmProvider(ha, 0); Log(L"[错误] 无法生成密钥对"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+    if (st != 0) { BCryptCloseAlgorithmProvider(ha, 0); Log(L"[错误] 无法生成密钥对"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
     
     st = BCryptFinalizeKeyPair(dk, 0);
-    if (st != 0) { BCryptDestroyKey(dk); BCryptCloseAlgorithmProvider(ha, 0); Log(L"[错误] 无法完成密钥对"); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+    if (st != 0) { BCryptDestroyKey(dk); BCryptCloseAlgorithmProvider(ha, 0); Log(L"[错误] 无法完成密钥对"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
     
     BCryptCloseAlgorithmProvider(ha, 0);
     std::vector<BYTE> csrDer = BuildCSR(domainA, dk, NULL);
@@ -580,7 +602,7 @@ static unsigned ApplyThreadInner() {
     Log(L"  CSR %d 字节", (int)csrDer.size());
 
     // Step 10: 提交 CSR
-    SetStatus(L"正在签发证书...");
+    SafeSetStatus(L"正在签发证书...");
     Log(L"Step 10: 提交 CSR 申请签发...");
     std::string finBody = "{\"csr\":\"" + csrB64 + "\"}";
     DWORD finHttpCode = 0;
@@ -592,20 +614,20 @@ static unsigned ApplyThreadInner() {
     }
     if (finResp.empty()) {
         Log(L"[错误] 订单完成失败 (HTTP %d)", finHttpCode); (void)BCryptDestroyKey(dk);
-        SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+        SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
     }
     if (finHttpCode >= 400) {
         std::string finErr = JsonStr(finResp, "detail");
         Log(L"[错误] CSR 提交被拒 (HTTP %d): %s", finHttpCode, A2W(finErr.empty() ? finResp.substr(0, 200) : finErr).c_str());
-        (void)BCryptDestroyKey(dk); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+        (void)BCryptDestroyKey(dk); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
     }
     std::string finStatus = JsonStr(finResp, "status");
     certUrl = JsonStr(finResp, "certificate");
     Log(L"  订单状态: %s", A2W(finStatus.empty() ? std::string("未知") : finStatus).c_str());
 
-    // Step 11: 等待证书
+    // Step 11: 等待证书（轮询订单状态，等待 status 不再是 pending/processing/ready）
     if (certUrl.empty()) {
-        SetStatus(L"正在下载证书...");
+        SafeSetStatus(L"正在下载证书...");
         Log(L"Step 11: 等待服务器打包证书...");
         for (int i = 0; i < 15; i++) {
             Sleep(3000);
@@ -614,27 +636,19 @@ static unsigned ApplyThreadInner() {
             if (orderCheckStatus == "invalid") {
                 std::string errDetail = JsonStr(check, "error");
                 Log(L"[错误] 订单状态无效: %s", A2W(errDetail.empty() ? check.substr(0, 200) : errDetail).c_str());
-                (void)BCryptDestroyKey(dk); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+                (void)BCryptDestroyKey(dk); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
             }
             certUrl = JsonStr(check, "certificate");
             if (!certUrl.empty()) break;
-            if (orderCheckStatus == "ready") {
-                Log(L"  等待... (%d/15) finalize 未生效，重新提交 CSR...", i + 1);
-                DWORD retryCode = 0;
-                std::string retryResp = AcmePost(finalizeUrl, finBody, g_AcmeNonce, false, NULL, &retryCode);
-                if (!retryResp.empty()) certUrl = JsonStr(retryResp, "certificate");
-                if (!certUrl.empty()) break;
-            } else {
-                Log(L"  等待... (%d/15) 状态: %s", i + 1, A2W(orderCheckStatus.empty() ? std::string("未知") : orderCheckStatus).c_str());
-            }
+            Log(L"  等待... (%d/15) 状态: %s", i + 1, A2W(orderCheckStatus.empty() ? std::string("未知") : orderCheckStatus).c_str());
         }
     }
-    if (certUrl.empty()) { Log(L"[错误] 获取证书下载链接超时"); (void)BCryptDestroyKey(dk); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+    if (certUrl.empty()) { Log(L"[错误] 获取证书下载链接超时"); (void)BCryptDestroyKey(dk); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
 
     // Step 12: 下载证书
     Log(L"Step 12: 下载证书链...");
     std::string certPem = AcmePost(certUrl, "", g_AcmeNonce, false);
-    if (certPem.empty()) { Log(L"[错误] 证书下载失败"); (void)BCryptDestroyKey(dk); SetStatus(L"失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+    if (certPem.empty()) { Log(L"[错误] 证书下载失败"); (void)BCryptDestroyKey(dk); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
 
     // 保存私钥和证书
     bool needPkcs1 = (si == 0 || si == 1);
@@ -660,7 +674,7 @@ static unsigned ApplyThreadInner() {
         if (!keySaved) {
             Log(L"[错误] 私钥保存失败，无法完成申请");
             (void)BCryptDestroyKey(dk);
-            SetStatus(L"私钥保存失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+            SafeSetStatus(L"私钥保存失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
         }
 
         bool certSaved = false;
@@ -681,7 +695,7 @@ static unsigned ApplyThreadInner() {
         if (!certSaved) {
             Log(L"[错误] 证书保存失败，无法完成申请");
             (void)BCryptDestroyKey(dk);
-            SetStatus(L"证书保存失败"); EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+            SafeSetStatus(L"证书保存失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
         }
 
         if (si == 2) Log(L"  提示: IIS 请导入 .pfx 文件（无密码）");
@@ -750,9 +764,9 @@ static unsigned ApplyThreadInner() {
     Log(L"  续签记录已保存: %s (保存目录: %s)", wd.c_str(), g_SaveDir.c_str());
 
     (void)BCryptDestroyKey(dk);
-    SetStatus(L"完成 - 证书已获取");
-    SetWindowTextW(g_hBtnApply, L"申请证书");
-    EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE);
+    SafeSetStatus(L"完成 - 证书已获取");
+    SafeSetWindowText(g_hBtnApply, L"申请证书");
+    SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE);
     g_Running = false;
     return 0;
 }
@@ -764,11 +778,12 @@ unsigned __stdcall ApplyThread(void*) {
     LeaveCriticalSection(&g_cs);
     __try { ApplyThreadInner(); }
     __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log(L"[致命错误] 证书申请线程异常终止"); SetStatus(L"失败 - 异常");
+        Log(L"[致命错误] 证书申请线程异常终止"); SafeSetStatus(L"失败 - 异常");
     }
+    InterlockedExchange(&g_AcmeBusyFlag, 0);
     if (g_Running) {
-        EnableWindow(g_hBtnApply, TRUE); EnableWindow(g_hDaysEdit, TRUE);
-        SetWindowTextW(g_hBtnApply, L"申请证书");
+        SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE);
+        SafeSetWindowText(g_hBtnApply, L"申请证书");
         EnterCriticalSection(&g_cs);
         if (g_hDnsReady) { 
             CloseHandle(g_hDnsReady); 

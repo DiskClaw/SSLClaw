@@ -149,12 +149,7 @@ std::wstring DnsCreateTxtRecord(int provider, const std::wstring& apiId, const s
     }
     case DNS_PROVIDER_CLOUDFLARE:
     {
-        // subDomain 已经是 _acme-challenge（或 @ 表示根域），传给 CF API 会自动在 zone 范围内补全域名
-        // 注意：@ 时传域名本身，非 @ 时传 subDomain 即可
-        // domain 参数在 CF 下是 Zone ID，不能当域名用
-        // 需要从 subDomain 和 Zone 名拼出完整记录名
-        // 但这里没有 Zone 名... 改用简单规则：subDomain==@ 则传 @ 表示根域，否则传 subDomain
-        // CF API: name 字段传 _acme-challenge 会自动解析为 _acme-challenge.zone-name
+        // CF API: domain 是 Zone ID；name 传 _acme-challenge 自动补全，@ 表示根域
         std::string recName;
         if (subDomain == L"@") {
             recName = "@";

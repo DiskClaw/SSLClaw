@@ -24,6 +24,8 @@ extern HWND g_hWebRoot;
 extern HWND g_hBtnWebRootBrowse;
 extern HWND g_hBtnWebRootOpen;
 extern HWND g_hCA;
+extern HWND g_hCAEnv;   // CA 环境选择(生产/测试)
+extern int g_CAEnvIndex; // 0=生产 1=测试
 extern HWND g_hCAInd;  // CA 连接指示灯
 extern HWND g_hCAStatus; // CA 状态文字
 extern HWND g_hWildcard;  // 通配符复选框（DNS-01 专用）
@@ -42,7 +44,19 @@ extern std::wstring g_IniPath;
 
 // 回调函数
 void Log(const wchar_t* fmt, ...);
+void LogUI(const wchar_t* fmt, ...);
 void SetStatus(const wchar_t* t);
+
+// 线程安全 UI 操作（后台线程必须用这些，自动判断是否需要 PostMessage）
+#define WM_SAFE_SETSTATUS   (WM_USER + 0x202)
+#define WM_SAFE_ENABLE      (WM_USER + 0x203)
+#define WM_SAFE_SETTEXT     (WM_USER + 0x204)
+#define WM_SAFE_INVALIDATE  (WM_USER + 0x205)
+
+void SafeSetStatus(const wchar_t* t);
+void SafeEnableWindow(HWND h, BOOL enable);
+void SafeSetWindowText(HWND h, const wchar_t* t);
+void SafeInvalidateRect(HWND h);
 
 // UI 函数
 void BrowseDir();
