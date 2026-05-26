@@ -150,7 +150,6 @@ static std::wstring DetectWebServer() {
         auto& r = results[i];
         result += L"\u25CF " + r.name;
         if (!r.version.empty()) result += L" " + r.version;
-        if (!r.path.empty()) result += L" (" + ShortDir(r.path) + L")";
     }
     return result;
 }

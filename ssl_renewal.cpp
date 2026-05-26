@@ -121,13 +121,15 @@ static FILETIME ReadCertExpiryFromDisk(const RenewalRecord& rec) {
 // ── 续签日志文件 ──
 static void LogRenewal(const wchar_t* fmt, ...) {
     va_list args; va_start(args, fmt);
-    wchar_t buf[4096]; vswprintf_s(buf, fmt, args); va_end(args);
+    wchar_t buf[4096]; _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, args); va_end(args);
     extern void LogToFile(const wchar_t* msg);
     LogToFile(buf);
     if (g_RenewWnd) {
         HWND hStatus = GetDlgItem(g_RenewWnd, 106);
-        if (hStatus && GetCurrentThreadId() == GetWindowThreadProcessId(g_RenewWnd, NULL))
-            SetWindowTextW(hStatus, buf);
+        if (hStatus) {
+            extern void SafeSetWindowText(HWND h, const wchar_t* t);
+            SafeSetWindowText(hStatus, buf);
+        }
     }
     extern HWND g_hWnd;
     if (g_hWnd) {
@@ -139,7 +141,7 @@ static void LogRenewal(const wchar_t* fmt, ...) {
 // 只写文件日志 + 状态栏，不显示在主日志栏（用于迁移提醒、续签模式等非关键状态信息）
 static void LogRenewalStatus(const wchar_t* fmt, ...) {
     va_list args; va_start(args, fmt);
-    wchar_t buf[4096]; vswprintf_s(buf, fmt, args); va_end(args);
+    wchar_t buf[4096]; _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, args); va_end(args);
     extern void LogToFile(const wchar_t* msg);
     LogToFile(buf);
     extern void SafeSetStatus(const wchar_t* t);
@@ -990,17 +992,17 @@ int RunRenewalMode() {
     EnterCriticalSection(&g_RenewCs);
     if (g_RenewalModeRunning) {
         LeaveCriticalSection(&g_RenewCs);
-        LogRenewalStatus(L"[续签模式] 已有续签流程运行中，跳过");
+        LogRenewalStatus(L"[续签] 流程运行中，跳过");
         return 0;
     }
     g_RenewalModeRunning = true;
     LeaveCriticalSection(&g_RenewCs);
 
-    LogRenewalStatus(L"[续签模式] 启动自动续签...");
+    LogRenewalStatus(L"[续签] 启动");
 
     // 如果后台线程正在运行，唤醒它处理续签，不重复执行
     if (g_RenewalThreadRunning) {
-        LogRenewalStatus(L"[续签模式] 后台线程运行中，唤醒处理");
+        LogRenewalStatus(L"[续签] 唤醒后台线程");
         WakeRenewalCheck();
         g_RenewalModeRunning = false;
         return 0;
@@ -1008,7 +1010,7 @@ int RunRenewalMode() {
 
     std::vector<RenewalRecord> records;
     if (!LoadRenewalRecords(records)) {
-        LogRenewalStatus(L"[续签模式] 无续签记录");
+        LogRenewalStatus(L"[续签] 无记录");
         g_RenewalModeRunning = false;
         return 0;
     }

@@ -105,25 +105,25 @@ extern void LoadDnsConfigForDomain(const std::wstring& domain);
 static unsigned ApplyThreadInner() {
     if (InterlockedCompareExchange(&g_AcmeBusyFlag, 1, 0) != 0) {
         Log(L"[错误] ACME 操作进行中，请稍后再试");
-        SafeSetStatus(L"ACME 忙碌"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+        SafeSetStatus(L"忙碌"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
     }
     const int MAX_DOMAIN_LEN = 256;
     wchar_t td[MAX_DOMAIN_LEN]; 
     int domainLen = GetWindowTextW(g_hDomain, td, MAX_DOMAIN_LEN);
     if (domainLen >= MAX_DOMAIN_LEN - 1) {
-        SafeSetStatus(L"域名过长(最大255字符)");
+        SafeSetStatus(L"域名过长");
         SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
     }
     wchar_t* p = td; while (*p == L' ') p++; std::wstring wd = p;
     while (!wd.empty() && wd.back() == L' ') wd.pop_back();
-    if (wd.empty()) { SafeSetStatus(L"域名不能为空"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+    if (wd.empty()) { SafeSetStatus(L"域名为空"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
 
     int verifyMode = (int)SendMessageW(g_hVerifyMode, CB_GETCURSEL, 0, 0);
     bool isWild = g_hWildcard && (SendMessageW(g_hWildcard, BM_GETCHECK, 0, 0) == BST_CHECKED);
     if (isWild) {
         if (verifyMode == 0) {
-            Log(L"[错误] 通配符证书仅支持 DNS-01 验证方式");
-            SafeSetStatus(L"通配符需 DNS-01");
+                Log(L"[错误] 通配符证书仅支持 DNS-01 验证方式");
+                SafeSetStatus(L"通配符需 DNS 验证");
             SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
         }
         if (wd.size() < 2 || wd[0] != L'*') wd = L"*." + wd;
@@ -135,7 +135,7 @@ static unsigned ApplyThreadInner() {
 
     wchar_t dtx[MAX_PATH]; GetWindowTextW(g_hSaveDirEdit, dtx, MAX_PATH);
     if (dtx[0]) g_SaveDir = dtx;
-    if (g_SaveDir.empty()) { SafeSetStatus(L"保存目录不能为空"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+    if (g_SaveDir.empty()) { SafeSetStatus(L"保存目录为空"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
 
     std::wstring nt = wd;
     if (nt.size() >= 2 && nt[0] == L'*' && nt[1] == L'.') nt = L"wildcard." + nt.substr(2);
@@ -153,7 +153,7 @@ static unsigned ApplyThreadInner() {
     const wchar_t* caName = g_CAIndex == 1 ? L"Let's Encrypt (Staging)" : L"Let's Encrypt";
     SafeEnableWindow(g_hBtnApply, FALSE);
     SafeEnableWindow(g_hDaysEdit, FALSE);
-    SafeSetStatus(L"正在申请证书...");
+    SafeSetStatus(L"申请中");
     Log(L"----------------------------------------");
     Log(L"  域名: %s", wd.c_str());
     if (!email.empty()) Log(L"  邮箱: %s", email.c_str());
@@ -165,7 +165,7 @@ static unsigned ApplyThreadInner() {
     Log(L"----------------------------------------");
 
     // Step 1: 加载账户密钥
-    SafeSetStatus(L"加载帐户密钥...");
+    SafeSetStatus(L"加载密钥...");
     Log(L"Step 1: 加载 ACME 帐户密钥...");
     std::string keyPath = W2A(g_SaveDir + L"\\acme_account" + GetAccountKeySuffix() + L".key");
     if (!LoadAccountKey(keyPath)) {
@@ -182,7 +182,7 @@ static unsigned ApplyThreadInner() {
     }
 
     // Step 2: 获取 ACME 目录
-    SafeSetStatus(L"连接 CA 服务器...");
+    SafeSetStatus(L"连接服务器...");
     Log(L"Step 2: 获取 ACME 目录 (%s)...", caName);
     g_AcmeNonce.clear();
     std::string dir = HttpJson(GetAcmeDirectory(), L"GET", NULL, 0, &g_AcmeNonce);
@@ -207,7 +207,7 @@ static unsigned ApplyThreadInner() {
     if (g_AcmeNonce.empty()) getNonce();
 
     // Step 3: 注册 ACME 账户
-    SafeSetStatus(L"注册 ACME 帐户...");
+    SafeSetStatus(L"注册帐户...");
     Log(L"Step 3: 注册帐户...");
     {
         std::string regBody = "{\"termsOfServiceAgreed\":true";
@@ -322,7 +322,7 @@ static unsigned ApplyThreadInner() {
         SafeSetStatus(L"获取授权...");
         Log(L"Step 5: 获取域名授权...");
         std::string authz = AcmePost(authzUrl, "", g_AcmeNonce, false);
-        if (authz.empty()) { Log(L"[错误] 授权获取失败"); SafeSetStatus(L"失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
+        if (authz.empty()) { Log(L"[错误] 授权获取失败"); SafeSetStatus(L"授权失败"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0; }
         if (authz.find("\"pending\"") == std::string::npos && authz.find("\"valid\"") == std::string::npos && authz.find("\"ready\"") == std::string::npos) {
             Log(L"  [调试] 授权响应: %s", A2W(authz.substr(0, 500)).c_str());
         }

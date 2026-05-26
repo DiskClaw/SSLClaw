@@ -88,60 +88,6 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     // 先确保 sslclaw.ini 是 UTF-16 LE BOM，再进行任何 INI 操作
     EnsureIniUtf16(g_IniPath.c_str());
 
-    // 迁移旧 INI 文件到统一 sslclaw.ini
-    {
-        std::wstring exeDir = exePath;
-        // 迁移续签记录: <exename>_renewals.ini → sslclaw.ini
-        {
-            std::wstring oldExe = exePath;
-            size_t dot = oldExe.rfind(L'.');
-            std::wstring oldRenewalIni = (dot != std::wstring::npos) ? oldExe.substr(0, dot) + L"_renewals.ini" : oldExe + L"_renewals.ini";
-            if (PathFileExistsW(oldRenewalIni.c_str())) {
-                EnsureIniUtf16(oldRenewalIni.c_str());
-                wchar_t secBuf[32768];
-                DWORD secLen = GetPrivateProfileSectionNamesW(secBuf, 32768, oldRenewalIni.c_str());
-                const wchar_t* p = secBuf;
-                while (*p && p < secBuf + secLen) {
-                    std::wstring sec(p);
-                    if (sec.find(L"Renewal:") == 0) {
-                        wchar_t keyBuf[32768];
-                        DWORD keyLen = GetPrivateProfileSectionW(sec.c_str(), keyBuf, 32768, oldRenewalIni.c_str());
-                        const wchar_t* k = keyBuf;
-                        while (*k && k < keyBuf + keyLen) {
-                            std::wstring kv(k);
-                            size_t eq = kv.find(L'=');
-                            if (eq != std::wstring::npos) {
-                                std::wstring key = kv.substr(0, eq);
-                                std::wstring val = kv.substr(eq + 1);
-                                WritePrivateProfileStringW(sec.c_str(), key.c_str(), val.c_str(), g_IniPath.c_str());
-                            }
-                            k += wcslen(k) + 1;
-                        }
-                    }
-                    p += wcslen(p) + 1;
-                }
-                DeleteFileW(oldRenewalIni.c_str());
-            }
-        }
-        // 迁移 SMTP 通知配置: settings.ini → sslclaw.ini [Notification]
-        {
-            std::wstring oldSettingsIni = exeDir + L"settings.ini";
-            if (PathFileExistsW(oldSettingsIni.c_str())) {
-                EnsureIniUtf16(oldSettingsIni.c_str());
-                const wchar_t* keys[] = { L"SmtpServer", L"SmtpPort", L"SmtpUser", L"SmtpPass", L"SmtpFrom", L"SmtpTo" };
-                bool hasAny = false;
-                for (auto key : keys) {
-                    wchar_t buf[4096];
-                    if (GetPrivateProfileStringW(L"Notification", key, L"", buf, 4096, oldSettingsIni.c_str()) && buf[0]) {
-                        WritePrivateProfileStringW(L"Notification", key, buf, g_IniPath.c_str());
-                        hasAny = true;
-                    }
-                }
-                if (hasAny) DeleteFileW(oldSettingsIni.c_str());
-            }
-        }
-    }
-
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = WndProc;
@@ -207,10 +153,7 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     // 根据当前验证方式显示步骤提示
     ShowVerifySteps((int)SendMessageW(g_hVerifyMode, CB_GETCURSEL, 0, 0));
 
-    // 迁移旧的 Windows 计划任务到后台线程模式
-    MigrateOldScheduledTask();
-
-    // 如果有自动续签记录，启动后台线程
+    // 加载配置
     {
         std::vector<RenewalRecord> records;
         LoadRenewalRecords(records);
