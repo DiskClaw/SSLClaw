@@ -1286,11 +1286,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     g_ipIndex = 0;
                     wchar_t display[128];
                     swprintf_s(display, L"本机IP: %s", g_ipList[0].c_str());
-                    SafeSetWindowText(g_hIP, display);
+                    SetWindowTextW(g_hIP, display);
                     if (g_ipList.size() > 1)
                         SetTimer(h, IP_TIMER_ID, 5000, NULL);
                 } else {
-                    SafeSetWindowText(g_hIP, L"本机IP: --");
+                    SetWindowTextW(g_hIP, L"本机IP: --");
                 }
             }
         }
