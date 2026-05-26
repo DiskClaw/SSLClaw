@@ -24,17 +24,14 @@ jobs:
     - name: Build Release x64
       run: msbuild SSLClaw.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /m
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: SSLClaw
-        path: x64\Release\SSLClaw.exe
+    - name: Zip Release
+      run: Compress-Archive -Path x64\Release\SSLClaw.exe -DestinationPath SSLClaw_${{ github.ref_name }}.zip
 
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/v')
       uses: softprops/action-gh-release@v2
       with:
-        files: x64\Release\SSLClaw.exe
+        files: SSLClaw_${{ github.ref_name }}.zip
         body: |
           ### v1.1 变更说明
 
