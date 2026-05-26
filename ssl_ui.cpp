@@ -1365,7 +1365,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetWindowPos(g_hLog, 0, LM, y, W - LM - RM, lh, 4);
         // 状态栏和 IP 紧跟日志下方,不依赖窗口总高度倒推
         int statusY = y + lh + 4;
-        SetWindowPos(g_hStatus, 0, LM, statusY, 150, sh, 4);
+        SetWindowPos(g_hStatus, 0, LM, statusY, 250, sh, 4);
         int ipW = 200;
         SetWindowPos(g_hIP, 0, W - RM - ipW, statusY, ipW, sh, 4);
         break;
@@ -1521,7 +1521,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             // 状态栏 - 紧贴底部，左边记录数，右边 Web 服务器检测
             int stY = btnY + btnH + 8;
             int stTotalW = cw - padX*2;
-            int leftW = 150;  // 左边“共 N 个续签记录”
+            int leftW = 250;  // 左边“共 N 个续签记录”
             CreateWindowW(L"STATIC", L"",
                 WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
                 padX, stY, leftW, statusH, g_RenewWnd, (HMENU)106, 0, 0);
