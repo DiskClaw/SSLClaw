@@ -1,0 +1,28 @@
+# Build artifacts
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.tmp
+*.pfx
+
+# VS cache
+.vs/
+x64/
+Debug/
+Release/
+SSLClaw/x64/
+
+# Runtime
+sslclaw.ini
+*.crt
+*.key
+
+# Reference source (not part of project)
+win-acme-master/
+
+# IDE
+.trae/
+.workbuddy/

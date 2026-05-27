@@ -1,0 +1,38 @@
+name: Build SSLClaw
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build Release x64
+      # GitHub runner 上 VS 版本落后于开发机，使用 v143（开发机用 v145）
+      run: msbuild SSLClaw.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /m
+
+    - name: Zip Release
+      run: Compress-Archive -Path x64\Release\SSLClaw.exe -DestinationPath SSLClaw_${{ github.ref_name }}.zip
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          x64/Release/SSLClaw.exe
+          SSLClaw_${{ github.ref_name }}.zip
+        body: "版本1.1.1\n正式/测试环境点击切换（先测试再正式避免acme限速）\n\nDNS API 自动验证（阿里云/腾讯云/Cloudflare）"
