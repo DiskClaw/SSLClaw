@@ -235,6 +235,6 @@ void StopTempHttpServer() {
     LeaveCriticalSection(&g_TempHttpCs);
 }
 
-extern "C" bool DoHttpSelfCheck(const std::wstring& host, const std::wstring& path, const std::string& expected, std::string& outBody) {
+bool DoHttpSelfCheck(const std::wstring& host, const std::wstring& path, const std::string& expected, std::string& outBody) {
     return HttpSelfCheck(host, path, outBody);
 }

@@ -528,6 +528,27 @@ bool PerformRenewal(RenewalRecord& record, bool* pSkipped = nullptr) {
                 DWORD written2 = 0; WriteFile(hcf, keyAuth.data(), (DWORD)keyAuth.size(), &written2, NULL); CloseHandle(hcf);
             }
             LogRenewal(L"  已写入: .well-known/acme-challenge/%s", A2W(token).c_str());
+
+                // HTTP 本地自检
+                SafeSetStatus(L"检查验证文件...");
+                LogRenewal(L"  本地自检验证文件...");
+                std::string selfChkBody;
+                std::wstring chkPath = L"/.well-known/acme-challenge/" + A2W(token);
+                std::wstring baseDomain4Chk = record.domain;
+                if (baseDomain4Chk.size() >= 2 && baseDomain4Chk[0] == L'*' && baseDomain4Chk[1] == L'.') baseDomain4Chk = baseDomain4Chk.substr(2);
+                if (DoHttpSelfCheck(baseDomain4Chk, chkPath, keyAuth, selfChkBody)) {
+                    if (selfChkBody.find(keyAuth) != std::string::npos) {
+                        LogRenewal(L"  本地自检通过，验证文件可正常访问");
+                    } else {
+                        LogRenewal(L"[错误] 本地自检返回内容不匹配: %.100S", selfChkBody.substr(0, 100).c_str());
+                        LogRenewal(L"[错误] 网站目录可能不正确，请检查网站目录设置");
+                        return false;
+                    }
+                } else {
+                    LogRenewal(L"[错误] 本地自检失败，无法访问验证文件");
+                    LogRenewal(L"[错误] 请确认域名 %s 指向本机、80 端口可访问、网站目录正确", baseDomain4Chk.c_str());
+                    return false;
+                }
         }
     } else {
         // DNS-01 验证
@@ -630,10 +651,34 @@ bool PerformRenewal(RenewalRecord& record, bool* pSkipped = nullptr) {
         std::string vStatus = JsonStr(stResult, "status");
         if (vStatus == "valid") { verified = true; break; }
         if (vStatus == "invalid") {
+            // 从 challenges 数组提取错误详情
+            std::string invDetail = JsonStr(stResult, "detail");
+            if (invDetail.empty()) {
+                size_t chArr2 = stResult.find("\"challenges\"");
+                if (chArr2 != std::string::npos) {
+                    size_t arrS2 = stResult.find('[', chArr2);
+                    if (arrS2 != std::string::npos) {
+                        size_t p2 = arrS2;
+                        while (true) {
+                            size_t ip2 = stResult.find("\"invalid\"", p2);
+                            if (ip2 == std::string::npos) break;
+                            size_t ep2 = stResult.find("\"error\"", p2);
+                            if (ep2 != std::string::npos) {
+                                std::string eType = JsonStr(stResult.substr(ep2, 300), "type");
+                                std::string eDetail = JsonStr(stResult.substr(ep2, 500), "detail");
+                                if (!eDetail.empty()) { invDetail = eDetail; break; }
+                                if (!eType.empty()) { invDetail = eType; break; }
+                            }
+                            p2 = ip2 + 1;
+                        }
+                    }
+                }
+            }
             if (useTempServer) StopTempHttpServer();
             else if (record.verifyMode == 0 && !challFile.empty()) DeleteFileW(challFile.c_str());
             if (dnsApiCreated) DnsDeleteTxtRecord(record.dnsProvider, record.dnsApiId, record.dnsApiSecret, zone, subDomain);
-            LogRenewal(L"[错误] 验证失败");
+            if (!invDetail.empty()) LogRenewal(L"[错误] 验证失败: %S", invDetail.c_str());
+            else LogRenewal(L"[错误] 验证失败，请检查域名解析和80端口可达性");
             SafeSetStatus(L"验证失败");
             SendNotificationEmail(L"SSLClaw 续签失败: " + record.domain, L"原因: ACME 服务器验证失败", record.saveDir, g_IniPath);
             return false;

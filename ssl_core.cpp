@@ -337,6 +337,27 @@ static unsigned ApplyThreadInner() {
                     DWORD written2 = 0; WriteFile(hcf, keyAuth.data(), (DWORD)keyAuth.size(), &written2, NULL); CloseHandle(hcf);
                 }
                 Log(L"  已写入: .well-known/acme-challenge/%s", A2W(token).c_str());
+
+                // HTTP 本地自检
+                SafeSetStatus(L"检查验证文件...");
+                Log(L"  本地自检验证文件...");
+                std::string selfChkBody;
+                std::wstring chkPath = L"/.well-known/acme-challenge/" + A2W(token);
+                if (DoHttpSelfCheck(wd, chkPath, keyAuth, selfChkBody)) {
+                    if (selfChkBody.find(keyAuth) != std::string::npos) {
+                        Log(L"  本地自检通过，验证文件可正常访问");
+                    } else {
+                        Log(L"[错误] 本地自检返回内容不匹配: %.100s", A2W(selfChkBody).c_str());
+                        Log(L"[错误] 网站目录可能不正确，请检查网站目录设置");
+                        DeleteFileW(challFile.c_str());
+                        SafeSetStatus(L"验证文件不可访问"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+                    }
+                } else {
+                    Log(L"[错误] 本地自检失败，无法访问验证文件");
+                    Log(L"[错误] 请确认域名 %s 指向本机、80 端口可访问、网站目录正确", wd.c_str());
+                    DeleteFileW(challFile.c_str());
+                    SafeSetStatus(L"验证文件不可访问"); SafeEnableWindow(g_hBtnApply, TRUE); SafeEnableWindow(g_hDaysEdit, TRUE); g_Running = false; return 0;
+                }
             }
         } else {
             // DNS-01
@@ -528,8 +549,32 @@ static unsigned ApplyThreadInner() {
             std::string authStatus = JsonStr(check, "status");
             if (authStatus == "valid") { verified = true; break; }
             if (authStatus == "invalid") {
+                // 从 challenges 数组提取错误详情
                 std::string errDetail = JsonStr(check, "detail");
+                if (errDetail.empty()) {
+                    size_t chArr = check.find("\"challenges\"");
+                    if (chArr != std::string::npos) {
+                        size_t arrStart = check.find('[', chArr);
+                        if (arrStart != std::string::npos) {
+                            // 找 invalid 的 challenge
+                            size_t pos = arrStart;
+                            while (true) {
+                                size_t invPos = check.find("\"invalid\"", pos);
+                                if (invPos == std::string::npos) break;
+                                size_t errPos = check.find("\"error\"", pos);
+                                if (errPos != std::string::npos && errPos < check.find(']', invPos)) {
+                                    std::string errType = JsonStr(check.substr(errPos, 300), "type");
+                                    std::string errDetail2 = JsonStr(check.substr(errPos, 500), "detail");
+                                    if (!errDetail2.empty()) { errDetail = errDetail2; break; }
+                                    if (!errType.empty()) { errDetail = errType; break; }
+                                }
+                                pos = invPos + 1;
+                            }
+                        }
+                    }
+                }
                 if (!errDetail.empty()) Log(L"  验证失败详情: %s", A2W(errDetail).c_str());
+                else Log(L"  验证失败，服务器未返回详细原因，请检查域名解析和80端口可达性");
                 break;
             }
             if (authStatus.empty()) {

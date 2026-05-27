@@ -63,6 +63,7 @@ std::string JsonStr(const std::string& json, const char* key);
 std::string HttpJson(const wchar_t* url, const wchar_t* method, const char* body, int bodyLen,
                      std::string* outNonce = NULL, std::string* outLocation = NULL,
                      DWORD* outStatusCode = NULL);
+bool DoHttpSelfCheck(const std::wstring& host, const std::wstring& path, const std::string& expected, std::string& outBody);
 
 // ACME 功能
 bool MakeAccountKey();
