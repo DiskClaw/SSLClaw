@@ -46,7 +46,8 @@ const wchar_t* GetAccountKeySuffix();
 extern int g_CAIndex;
 
 // 续签后台线程配置
-#define RENEWAL_CHECK_INTERVAL_SEC (6 * 60 * 60)  // 6小时检查一次
+#define RENEWAL_CHECK_INTERVAL_SEC (6 * 60 * 60)  // 默认 6h 巡逻
+#define RENEWAL_CHECK_FAST_SEC (5 * 60)            // 有到期证书时 5min 快速检查
 #define RENEWAL_RETRY_MAX_HOURS 24                 // 最大重试间隔24小时
 #define RENEWAL_SCRIPT_TIMEOUT_MS 120000           // 脚本执行超时2分钟
 
@@ -93,15 +94,16 @@ extern BCRYPT_KEY_HANDLE g_AccKey;
 extern std::string g_AccPubB64;
 extern std::string g_AccExpB64;
 extern std::string g_AccURL;
-extern std::wstring g_AccURLPath;  // 账户 URL 持久化路径
 extern std::wstring g_IniPath;     // 统一配置文件路径
+extern std::string g_AcmeNonce;   // ACME Nonce（受 g_AcmeBusyFlag 串行化保护）
 
 // 日志文件
 extern std::wstring g_LogFilePath;
 void LogToFile(const wchar_t* msg);
 
 // 证书申请线程
-extern bool g_Running;
+// volatile 确保等待循环中编译器不会缓存该值（线程间可见性）
+extern volatile bool g_Running;
 extern bool g_AutoScroll;
 extern HANDLE g_hDnsReady;  // DNS-01 手动继续事件
 extern std::wstring g_WebRoot;
@@ -117,6 +119,9 @@ std::wstring GeneratePassword(int len = 24);
 
 // 续签系统
 
+// 到期前 7 天触发续签
+#define DEFAULT_RENEWAL_DAYS 7
+
 // 续签记录
 struct RenewalRecord {
     std::wstring domain;        // 域名
@@ -131,7 +136,7 @@ struct RenewalRecord {
     std::wstring friendlyName; // 证书友好名称
     FILETIME issueTime = {};   // 签发时间
     FILETIME expiryTime = {};  // 过期时间
-    int renewalDays = 60;      // 提前多少天续签
+    int renewalDays = DEFAULT_RENEWAL_DAYS; // 提前多少天续签
     std::wstring preScript;    // 前置脚本
     std::wstring postScript;   // 后置脚本
     // DNS-01 API 自动化（密钥不存续签记录，续签时从主配置读取）
@@ -149,8 +154,8 @@ void AddOrUpdateRenewal(const RenewalRecord& record);
 // 续签检查（返回需要续签的记录索引列表）
 std::vector<int> GetRenewalsDue(const std::vector<RenewalRecord>& records);
 
-// 执行单个续签
-bool PerformRenewal(RenewalRecord& record);
+// 执行单个续签（pSkipped=true 表示因 ACME 锁冲突被跳过，不计入重试）
+bool PerformRenewal(RenewalRecord& record, bool* pSkipped = nullptr);
 
 // Windows 计划任务管理（兼容保留，新代码用后台线程）
 bool CreateRenewalTask();
@@ -218,7 +223,7 @@ bool DnsVerifyApi(int provider, const std::wstring& apiId, const std::wstring& a
 // DPAPI 加密/解密字符串
 std::string ProtectString(const std::string& clearText);
 std::string UnprotectString(const std::string& protectedText);
-void EnsureIniUtf16(const wchar_t* iniPath);
+void EnsureIniUtf8(const wchar_t* iniPath);
 void WriteProtectedProfileStringW(const wchar_t* iniPath, const wchar_t* section, const wchar_t* key, const std::wstring& value);
 std::wstring GetProtectedProfileStringW(const wchar_t* iniPath, const wchar_t* section, const wchar_t* key, const wchar_t* def);
 
@@ -227,3 +232,54 @@ bool DnsPreValidateAuthoritative(const std::wstring& queryName, const std::wstri
 
 // SMTP 邮件通知
 void SendNotificationEmail(const std::wstring& subject, const std::wstring& body, const std::wstring& saveDir, const std::wstring& iniPath);
+
+// ── 跨模块共享函数声明（原先散落在 .cpp 中用 extern 引用） ──
+
+// 文件原子写入（ssl_utils.cpp）
+bool WriteFileAtomic(const std::string& path, const std::string& content);
+
+// HTTP 临时验证服务器（ssl_http.cpp）
+bool IsPort80Free();
+bool StartTempHttpServer(const std::string& token, const std::string& keyAuth);
+void StopTempHttpServer();
+std::string DnsHttp(const std::string& url, const std::string& method,
+    const std::string& contentType, const std::string& body,
+    const std::vector<std::pair<std::string, std::string>>& headers);
+
+// PFX 导出（ssl_deploy.cpp）
+bool SavePFX(BCRYPT_KEY_HANDLE dk, const std::string& certPem, const std::wstring& pfxPath);
+
+// HMAC / Hash 辅助（ssl_utils.cpp）
+std::vector<BYTE> HmacSha1(const std::string& key, const std::string& data);
+std::vector<BYTE> HmacSha256Raw(const std::string& key, const std::string& data);
+std::vector<BYTE> HmacSha256Raw(const std::vector<BYTE>& key, const std::string& data);
+std::string Sha256Hex(const std::string& data);
+
+// DNS TXT 查询（ssl_dnsapi.cpp）
+bool DnsTxtExists(const std::wstring& queryName);
+
+// ── 公共辅助函数（消除 ssl_core.cpp / ssl_renewal.cpp 间的重复代码） ──
+
+// 从 PEM 证书内容解析到期时间（写临时文件 → CertOpenStore → 提取 NotAfter）
+FILETIME ParseCertExpiryFromPem(const std::string& certPem);
+
+// 导出私钥为 PEM 字符串（根据 serverType 选择 PKCS#1 或 PKCS#8）
+// serverType: 0/1=PKCS#1, 2=PFX(不导出PEM), 3=PKCS#8
+std::string ExportPrivateKeyPem(BCRYPT_KEY_HANDLE dk, int serverType);
+
+// DNS TXT 传播检查（权威预验证 + 本地 DnsQuery 回退 + 额外等待）
+// 返回 true 表示 DNS 已生效
+bool WaitForDnsTxtPropagation(const std::wstring& queryName, const std::wstring& expectedValue,
+    const std::string& challengeB64, const wchar_t* logPrefix);
+
+// 将域名转换为安全的文件名（通配符前缀替换 + 非法字符替换 + 长度限制）
+std::wstring SanitizeDomainToFileName(const std::wstring& domain);
+
+// 递归创建目录（确保保存目录存在）
+bool EnsureDirectoryExists(const std::wstring& path);
+
+// 保存证书文件（私钥 + 证书 + PFX），返回是否全部成功
+// outPfxPath: 若 serverType==2 则填充 PFX 路径
+bool SaveCertFiles(BCRYPT_KEY_HANDLE dk, const std::string& certPem,
+    const std::wstring& saveDir, const std::wstring& nt, int serverType,
+    std::wstring* outPfxPath = nullptr, const wchar_t* logPrefix = nullptr);

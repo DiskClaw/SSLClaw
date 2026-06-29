@@ -2,6 +2,8 @@
 #include "ssl_ui.h"
 #include "ssl_core.h"
 #include <commctrl.h>
+#include <uxtheme.h>
+#pragma comment(lib, "uxtheme.lib")
 #include <thread>
 #pragma comment(lib, "comctl32.lib")
 #include <iphlpapi.h>
@@ -157,6 +159,10 @@ static std::wstring DetectWebServer() {
 // 续签窗口原过程（全局变量，用于子类化恢复）
 static WNDPROC g_OrigRenewProc = NULL;
 HWND g_RenewWnd = NULL;
+// 防止 ListView 刷新时 LVN_ITEMCHANGED 误触发 autoRenew 逻辑
+static volatile BOOL g_SuppressCheckEvent = FALSE;
+// 待删除域名（保存时生效，关窗放弃）
+static std::set<std::wstring> g_PendingDeletes;
 
 // ── 托盘图标 ──
 UINT WM_TASKBARCREATED = 0;  // 任务栏重建消息
@@ -194,14 +200,8 @@ void LoadDnsConfig() {
     g_DnsProvider = prov;
     GetPrivateProfileStringW(L"DNSConfig", L"ApiId", L"", buf, 512, ini.c_str());
     g_DnsApiId = buf;
-    if (g_DnsApiId.size() >= 4 && (g_DnsApiId.substr(0, 4) == L"aes-" || g_DnsApiId.substr(0, 4) == L"enc-")) {
-        g_DnsApiId = GetProtectedProfileStringW(ini.c_str(), L"DNSConfig", L"ApiId", L"");
-    }
     GetPrivateProfileStringW(L"DNSConfig", L"ApiSecret", L"", buf, 512, ini.c_str());
     g_DnsApiSecret = buf;
-    if (g_DnsApiSecret.size() >= 4 && (g_DnsApiSecret.substr(0, 4) == L"aes-" || g_DnsApiSecret.substr(0, 4) == L"enc-")) {
-        g_DnsApiSecret = GetProtectedProfileStringW(ini.c_str(), L"DNSConfig", L"ApiSecret", L"");
-    }
 }
 
 void LoadDnsConfigForDomain(const std::wstring& domain) {
@@ -219,15 +219,23 @@ void LoadDnsConfigForDomain(const std::wstring& domain) {
     int prov = _wtoi(buf);
     if (prov < 1 || prov > 3) { LoadDnsConfig(); return; }
     g_DnsProvider = prov;
-    GetPrivateProfileStringW(sec.c_str(), L"ApiId", L"", buf, 512, ini.c_str());
-    g_DnsApiId = buf;
-    if (g_DnsApiId.size() >= 4 && (g_DnsApiId.substr(0, 4) == L"aes-" || g_DnsApiId.substr(0, 4) == L"enc-")) {
-        g_DnsApiId = GetProtectedProfileStringW(ini.c_str(), sec.c_str(), L"ApiId", L"");
+    // 优先读 per-provider keys，向后兼容旧格式
+    wchar_t keyId[16], keySec[16];
+    swprintf_s(keyId, L"ApiId_%d", prov);
+    swprintf_s(keySec, L"ApiSecret_%d", prov);
+    GetPrivateProfileStringW(sec.c_str(), keyId, L"", buf, 512, ini.c_str());
+    if (buf[0] != 0) {
+        g_DnsApiId = buf;
+    } else {
+        GetPrivateProfileStringW(sec.c_str(), L"ApiId", L"", buf, 512, ini.c_str());
+        g_DnsApiId = buf;
     }
-    GetPrivateProfileStringW(sec.c_str(), L"ApiSecret", L"", buf, 512, ini.c_str());
-    g_DnsApiSecret = buf;
-    if (g_DnsApiSecret.size() >= 4 && (g_DnsApiSecret.substr(0, 4) == L"aes-" || g_DnsApiSecret.substr(0, 4) == L"enc-")) {
-        g_DnsApiSecret = GetProtectedProfileStringW(ini.c_str(), sec.c_str(), L"ApiSecret", L"");
+    GetPrivateProfileStringW(sec.c_str(), keySec, L"", buf, 512, ini.c_str());
+    if (buf[0] != 0) {
+        g_DnsApiSecret = buf;
+    } else {
+        GetPrivateProfileStringW(sec.c_str(), L"ApiSecret", L"", buf, 512, ini.c_str());
+        g_DnsApiSecret = buf;
     }
 }
 
@@ -239,8 +247,14 @@ void SaveDnsConfigForDomain(const std::wstring& domain) {
     std::wstring ini = g_IniPath;
     wchar_t buf[32]; swprintf_s(buf, L"%d", g_DnsProvider);
     WritePrivateProfileStringW(sec.c_str(), L"Provider", buf, ini.c_str());
+    // 写入当前提供商的 per-provider keys + 兼容旧格式
     WritePrivateProfileStringW(sec.c_str(), L"ApiId", g_DnsApiId.c_str(), ini.c_str());
     WritePrivateProfileStringW(sec.c_str(), L"ApiSecret", g_DnsApiSecret.c_str(), ini.c_str());
+    wchar_t keyId[16], keySec[16];
+    swprintf_s(keyId, L"ApiId_%d", g_DnsProvider);
+    swprintf_s(keySec, L"ApiSecret_%d", g_DnsProvider);
+    WritePrivateProfileStringW(sec.c_str(), keyId, g_DnsApiId.c_str(), ini.c_str());
+    WritePrivateProfileStringW(sec.c_str(), keySec, g_DnsApiSecret.c_str(), ini.c_str());
 }
 
 // 子类化对话框控件 ID
@@ -252,6 +266,14 @@ void SaveDnsConfigForDomain(const std::wstring& domain) {
 #define IDC_DNS_OK 1
 #define IDC_DNS_CANCEL 2
 #define IDC_DNS_DOMAIN 40
+
+// 按提供商缓存凭据（切换下拉框时保留各提供商的输入）
+struct DnsProvCreds {
+    std::wstring id[4];     // index 1=Aliyun, 2=Tencent, 3=Cloudflare
+    std::wstring secret[4];
+    int currentProv;        // 当前显示的提供商（1/2/3）
+};
+#define DNS_CREDS_PROP L"DnsProvCredsPtr"
 
 // 子类化对话框过程
 static WNDPROC g_OrigDnsDlgProc = NULL;
@@ -265,17 +287,67 @@ static LRESULT CALLBACK DnsConfigDlgProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp
             std::wstring idVal = buf;
             GetWindowTextW(GetDlgItem(hw, IDC_DNS_SECRET), buf, 512);
             std::wstring secVal = buf;
+
+            // 保存当前输入到缓存
+            DnsProvCreds* creds = (DnsProvCreds*)GetPropW(hw, DNS_CREDS_PROP);
+            if (creds) {
+                creds->id[sel] = idVal;
+                creds->secret[sel] = secVal;
+            }
+
             g_DnsProvider = sel;
             g_DnsApiId = idVal;
             g_DnsApiSecret = secVal;
             SaveDnsConfigForDomain(g_DnsConfigDomain);
+
+            // 同时保存所有提供商的凭据到 INI（方便下次打开恢复）
+            if (creds) {
+                std::wstring baseDomain = g_DnsConfigDomain;
+                if (baseDomain.size() >= 2 && baseDomain[0] == L'*' && baseDomain[1] == L'.')
+                    baseDomain = baseDomain.substr(2);
+                std::wstring sec = DnsSectionName(baseDomain);
+                for (int p = 1; p <= 3; p++) {
+                    wchar_t keyId[16], keySec[16];
+                    swprintf_s(keyId, L"ApiId_%d", p);
+                    swprintf_s(keySec, L"ApiSecret_%d", p);
+                    WritePrivateProfileStringW(sec.c_str(), keyId, creds->id[p].c_str(), g_IniPath.c_str());
+                    WritePrivateProfileStringW(sec.c_str(), keySec, creds->secret[p].c_str(), g_IniPath.c_str());
+                }
+            }
+
+            // 同步更新续签记录中的 dnsProvider 字段，使列表显示一致
+            {
+                std::wstring baseDomain = g_DnsConfigDomain;
+                if (baseDomain.size() >= 2 && baseDomain[0] == L'*' && baseDomain[1] == L'.')
+                    baseDomain = baseDomain.substr(2);
+                std::wstring renewSec = L"Renewal:" + baseDomain;
+                wchar_t provBuf[32]; swprintf_s(provBuf, L"%d", sel);
+                WritePrivateProfileStringW(renewSec.c_str(), L"dnsProvider", provBuf, g_IniPath.c_str());
+            }
+
+            // 通知父窗口刷新续签列表（WM_USER+1 仅续签窗口处理，主窗口忽略）
+            HWND hParent = GetParent(hw);
+            if (hParent) PostMessageW(hParent, WM_USER + 1, 0, 0);
+
             SetWindowTextW(GetDlgItem(hw, 30), L"已保存");
             DestroyWindow(hw);
             return 0;
         } else if (id == IDC_DNS_PROV && HIWORD(wp) == CBN_SELCHANGE) {
+            DnsProvCreds* creds = (DnsProvCreds*)GetPropW(hw, DNS_CREDS_PROP);
             int sel = (int)SendMessageW(GetDlgItem(hw, IDC_DNS_PROV), CB_GETCURSEL, 0, 0) + 1;
-            SetWindowTextW(GetDlgItem(hw, IDC_DNS_ID), L"");
-            SetWindowTextW(GetDlgItem(hw, IDC_DNS_SECRET), L"");
+            if (creds) {
+                // 切换前：将当前输入框内容保存到旧提供商的缓存
+                wchar_t buf[512];
+                GetWindowTextW(GetDlgItem(hw, IDC_DNS_ID), buf, 512);
+                creds->id[creds->currentProv] = buf;
+                GetWindowTextW(GetDlgItem(hw, IDC_DNS_SECRET), buf, 512);
+                creds->secret[creds->currentProv] = buf;
+                // 切换后：从缓存恢复目标提供商的凭据
+                creds->currentProv = sel;
+                SetWindowTextW(GetDlgItem(hw, IDC_DNS_ID), creds->id[sel].c_str());
+                SetWindowTextW(GetDlgItem(hw, IDC_DNS_SECRET), creds->secret[sel].c_str());
+            }
+            // 更新标签和教程
             if (sel == DNS_PROVIDER_ALIYUN) {
                 SetWindowTextW(GetDlgItem(hw, IDC_DNS_LBL_ID), L"AccessKey ID");
                 SetWindowTextW(GetDlgItem(hw, IDC_DNS_LBL_SECRET), L"AccessKey Secret");
@@ -374,6 +446,8 @@ static LRESULT CALLBACK DnsConfigDlgProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp
         DestroyWindow(hw);
         return 0;
     } else if (msg == WM_DESTROY) {
+        DnsProvCreds* creds = (DnsProvCreds*)RemovePropW(hw, DNS_CREDS_PROP);
+        if (creds) delete creds;
         SetWindowLongPtrW(hw, GWLP_WNDPROC, (LONG_PTR)g_OrigDnsDlgProc);
         g_OrigDnsDlgProc = NULL;
         return 0;
@@ -395,6 +469,8 @@ void ShowDnsConfigDialog(HWND hwParent, const std::wstring& overrideDomain) {
     // 从 INI 独立加载指定域名的 DNS 配置（不污染全局变量）
     int dnsProv = DNS_PROVIDER_ALIYUN;
     std::wstring dnsApiId, dnsApiSecret;
+    DnsProvCreds* creds = new DnsProvCreds{};
+    creds->currentProv = DNS_PROVIDER_ALIYUN;
     {
         std::wstring baseDomain = g_DnsConfigDomain;
         if (baseDomain.size() >= 2 && baseDomain[0] == L'*' && baseDomain[1] == L'.')
@@ -406,14 +482,25 @@ void ShowDnsConfigDialog(HWND hwParent, const std::wstring& overrideDomain) {
         if (buf[0] != 0) {
             int p = _wtoi(buf);
             if (p >= 1 && p <= 3) dnsProv = p;
-            GetPrivateProfileStringW(sec.c_str(), L"ApiId", L"", buf, 512, ini.c_str());
-            dnsApiId = buf;
-            if (dnsApiId.size() >= 4 && (dnsApiId.substr(0, 4) == L"aes-" || dnsApiId.substr(0, 4) == L"enc-"))
-                dnsApiId = GetProtectedProfileStringW(ini.c_str(), sec.c_str(), L"ApiId", L"");
-            GetPrivateProfileStringW(sec.c_str(), L"ApiSecret", L"", buf, 512, ini.c_str());
-            dnsApiSecret = buf;
-            if (dnsApiSecret.size() >= 4 && (dnsApiSecret.substr(0, 4) == L"aes-" || dnsApiSecret.substr(0, 4) == L"enc-"))
-                dnsApiSecret = GetProtectedProfileStringW(ini.c_str(), sec.c_str(), L"ApiSecret", L"");
+            // 加载所有提供商的凭据（per-provider keys）
+            for (int i = 1; i <= 3; i++) {
+                wchar_t keyId[16], keySec[16];
+                swprintf_s(keyId, L"ApiId_%d", i);
+                swprintf_s(keySec, L"ApiSecret_%d", i);
+                GetPrivateProfileStringW(sec.c_str(), keyId, L"", buf, 512, ini.c_str());
+                creds->id[i] = buf;
+                GetPrivateProfileStringW(sec.c_str(), keySec, L"", buf, 512, ini.c_str());
+                creds->secret[i] = buf;
+            }
+            // 向后兼容：如果 per-provider keys 为空，用旧的 ApiId/ApiSecret 填充当前提供商
+            if (creds->id[dnsProv].empty() && creds->secret[dnsProv].empty()) {
+                GetPrivateProfileStringW(sec.c_str(), L"ApiId", L"", buf, 512, ini.c_str());
+                creds->id[dnsProv] = buf;
+                GetPrivateProfileStringW(sec.c_str(), L"ApiSecret", L"", buf, 512, ini.c_str());
+                creds->secret[dnsProv] = buf;
+            }
+            dnsApiId = creds->id[dnsProv];
+            dnsApiSecret = creds->secret[dnsProv];
         } else {
             // 该域名无独立配置，回退读全局默认
             GetPrivateProfileStringW(L"DNSConfig", L"Provider", L"1", buf, 512, ini.c_str());
@@ -421,13 +508,12 @@ void ShowDnsConfigDialog(HWND hwParent, const std::wstring& overrideDomain) {
             if (p >= 1 && p <= 3) dnsProv = p;
             GetPrivateProfileStringW(L"DNSConfig", L"ApiId", L"", buf, 512, ini.c_str());
             dnsApiId = buf;
-            if (dnsApiId.size() >= 4 && (dnsApiId.substr(0, 4) == L"aes-" || dnsApiId.substr(0, 4) == L"enc-"))
-                dnsApiId = GetProtectedProfileStringW(ini.c_str(), L"DNSConfig", L"ApiId", L"");
             GetPrivateProfileStringW(L"DNSConfig", L"ApiSecret", L"", buf, 512, ini.c_str());
             dnsApiSecret = buf;
-            if (dnsApiSecret.size() >= 4 && (dnsApiSecret.substr(0, 4) == L"aes-" || dnsApiSecret.substr(0, 4) == L"enc-"))
-                dnsApiSecret = GetProtectedProfileStringW(ini.c_str(), L"DNSConfig", L"ApiSecret", L"");
+            creds->id[dnsProv] = dnsApiId;
+            creds->secret[dnsProv] = dnsApiSecret;
         }
+        creds->currentProv = dnsProv;
     }
 
     const int DLG_W = 480, DLG_H = 480;
@@ -582,6 +668,7 @@ void ShowDnsConfigDialog(HWND hwParent, const std::wstring& overrideDomain) {
     SetWindowLongPtrW(hDlg, GWLP_USERDATA, (LONG_PTR)hTutorial);
 
     g_OrigDnsDlgProc = (WNDPROC)SetWindowLongPtrW(hDlg, GWLP_WNDPROC, (LONG_PTR)DnsConfigDlgProc);
+    SetPropW(hDlg, DNS_CREDS_PROP, (HANDLE)creds);
 
     ShowWindow(hDlg, SW_SHOW);
     SetFocus(hSave);
@@ -678,33 +765,58 @@ LRESULT CALLBACK RenewWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             } else {
                 MessageBoxW(hw, L"未找到续签记录，请通过主界面重新申请", L"提示", MB_OK);
             }
-        } else if (id == 102) {
-            SendMessageW(hw, WM_USER+1, 0, 0);
-        } else if (id == 103) {
-            // 切换自动续签
-            int sel = ListView_GetNextItem(hL, -1, LVNI_SELECTED);
-            if (sel < 0) { MessageBoxW(hw, L"请先选择一个证书", L"提示", MB_OK); return 0; }
-            wchar_t domain[256] = {};
-            ListView_GetItemText(hL, sel, 0, domain, 256);
+        } else if (id == 108) {
+            // 保存
             std::vector<RenewalRecord> records; LoadRenewalRecords(records);
-            int ri = FindRenewalByDomain(records, std::wstring(domain));
-            if (ri >= 0) {
-                records[ri].autoRenew = !records[ri].autoRenew;
-                SaveRenewalRecords(records);
-                wchar_t arText[16]; wcscpy_s(arText, records[ri].autoRenew ? L"已开启" : L"未开启");
-                ListView_SetItemText(hL, sel, 3, arText);
-                ListView_SetCheckState(hL, sel, records[ri].autoRenew ? TRUE : FALSE);
-                if (records[ri].autoRenew && !IsRenewalBackgroundRunning()) {
-                    StartRenewalBackgroundThread();
-                    MessageBoxW(hw, L"已启动后台续签检查（每 6 小时自动检查）\n无需 Windows 计划任务", L"自动续签", MB_OK);
+            int cnt = ListView_GetItemCount(hL);
+            bool anyChange = false;
+            for (int i = 0; i < cnt; i++) {
+                wchar_t domain[256] = {};
+                ListView_GetItemText(hL, i, 0, domain, 256);
+                int ri = FindRenewalByDomain(records, std::wstring(domain));
+                if (ri >= 0) {
+                    BOOL newCheck = ListView_GetCheckState(hL, i);
+                    bool newAuto = (newCheck == TRUE);
+                    if (records[ri].autoRenew != newAuto) {
+                        records[ri].autoRenew = newAuto;
+                        anyChange = true;
+                    }
+                    // 同步显示文字
+                    wchar_t arText[8]; wcscpy_s(arText, newAuto ? L"开" : L"关");
+                    ListView_SetItemText(hL, i, 3, arText);
                 }
-                if (!records[ri].autoRenew) {
-                    bool anyAuto = false;
-                    for (auto& r : records) if (r.autoRenew) { anyAuto = true; break; }
-                    if (!anyAuto) StopRenewalBackgroundThread();
+            }
+            // 处理待删除记录
+            if (!g_PendingDeletes.empty()) {
+                for (auto it = records.begin(); it != records.end(); ) {
+                    if (g_PendingDeletes.count(it->domain)) {
+                        it = records.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                anyChange = true;
+                g_PendingDeletes.clear();
+            }
+            if (anyChange) {
+                SaveRenewalRecords(records);
+                // 同步刷新主界面域名下拉列表
+                RefreshDomainCombo();
+                // 检查是否有任何自动续签
+                bool anyAuto = false;
+                for (auto& r : records) if (r.autoRenew) { anyAuto = true; break; }
+                if (anyAuto && !IsRenewalBackgroundRunning()) {
+                    StartRenewalBackgroundThread();
+                    SetWindowTextW(GetDlgItem(hw, 106), L"已保存，后台续签已启动");
+                } else if (!anyAuto && IsRenewalBackgroundRunning()) {
+                    // 异步停止，避免阻塞 UI
+                    std::thread([](){ StopRenewalBackgroundThread(); }).detach();
+                    SetWindowTextW(GetDlgItem(hw, 106), L"已保存，后台续签已停止");
+                } else {
+                    SetWindowTextW(GetDlgItem(hw, 106), L"已保存");
                 }
             } else {
-                MessageBoxW(hw, L"未找到续签记录，请通过主界面重新申请", L"提示", MB_OK);
+                SetWindowTextW(GetDlgItem(hw, 106), L"无变更");
             }
         } else if (id == 104) {
             // DNS API 配置 - 使用选中记录的域名
@@ -720,9 +832,19 @@ LRESULT CALLBACK RenewWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             ShowDnsConfigDialog(hw, dnsDomain);
-        } else if (id == 105 || id == 107 || id == 1099) {
-            // 已移除的按钮ID，忽略
+        } else if (id == 105) {
+            // 删除（仅移除 UI，保存时生效）
+            int sel = ListView_GetNextItem(hL, -1, LVNI_SELECTED);
+            if (sel < 0) { MessageBoxW(hw, L"请先选择一条记录", L"提示", MB_OK); return 0; }
+            wchar_t domain[256] = {};
+            ListView_GetItemText(hL, sel, 0, domain, 256);
+            // 加入待删除集合，从 UI 移除
+            g_PendingDeletes.insert(std::wstring(domain));
+            ListView_DeleteItem(hL, sel);
+        } else if (id == 102 || id == 103 || id == 107 || id == 1099) {
+            // 忽略已移除的按钮
         }
+        return 0; // 消费 WM_COMMAND
     } else if (msg == WM_USER + 2) {
         // 续签完成回调（后台线程通过 PostMessage 触发）
         EnableWindow(GetDlgItem(hw, 101), TRUE);
@@ -733,17 +855,22 @@ LRESULT CALLBACK RenewWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         // 刷新列表 - 基于 RenewalRecord，不扫 Certificate Store
         HWND hL = GetDlgItem(hw, 100);
         HWND hSt = GetDlgItem(hw, 106);
+        // 抑制 LVN_ITEMCHANGED，防止刷新时误触发 autoRenew 逻辑
+        g_SuppressCheckEvent = TRUE;
         ListView_DeleteAllItems(hL);
 
         std::vector<RenewalRecord> records;
         LoadRenewalRecords(records);
         if (records.empty()) {
             SetWindowTextW(hSt, L"暂无续签记录，请先通过主界面申请证书");
+            g_SuppressCheckEvent = FALSE;
             return 0;
         }
 
         int idx = 0;
         for (auto& r : records) {
+            // 跳过待删除记录
+            if (g_PendingDeletes.count(r.domain)) continue;
             LVITEMW item = {};
             item.mask = LVIF_TEXT;
             item.iItem = idx;
@@ -792,6 +919,8 @@ LRESULT CALLBACK RenewWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         }
         wchar_t buf[64]; swprintf_s(buf, L"共 %d 个续签记录", idx);
         SetWindowTextW(hSt, buf);
+        // 恢复 LVN_ITEMCHANGED 事件处理
+        g_SuppressCheckEvent = FALSE;
 
         // 检测本地 Web 服务器并显示在右侧
         std::wstring ws = DetectWebServer();
@@ -803,31 +932,29 @@ LRESULT CALLBACK RenewWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             // 双击列表项 = 详情
             ShowDetailDialog(hw);
         } else if (pnm->idFrom == 100 && pnm->code == LVN_ITEMCHANGED) {
+            // 列表刷新时 ListView_SetCheckState 会触发此事件，用标志位过滤
+            if (g_SuppressCheckEvent) return 0;
             NMLISTVIEW* pnmv = (NMLISTVIEW*)lp;
             if (pnmv->uChanged & LVIF_STATE) {
+                // 仅响应用户点击复选框的状态变化（LVIS_STATEIMAGEMASK 变化）
+                if (!(pnmv->uOldState & LVIS_STATEIMAGEMASK) != !(pnmv->uNewState & LVIS_STATEIMAGEMASK)) {
                 BOOL newCheck = ListView_GetCheckState(pnmv->hdr.hwndFrom, pnmv->iItem);
                 wchar_t domain[256] = {};
                 ListView_GetItemText(pnmv->hdr.hwndFrom, pnmv->iItem, 0, domain, 256);
                 std::vector<RenewalRecord> records; LoadRenewalRecords(records);
                 int ri = FindRenewalByDomain(records, std::wstring(domain));
                 if (ri >= 0) {
-                    bool wasAuto = records[ri].autoRenew;
-                    records[ri].autoRenew = (newCheck == TRUE);
-                    SaveRenewalRecords(records);
-                    wchar_t arText[16]; wcscpy_s(arText, records[ri].autoRenew ? L"已开启" : L"未开启");
+                    // 仅更新 UI，保存时持久化
+                    wchar_t arText[8]; wcscpy_s(arText, (newCheck == TRUE) ? L"开" : L"关");
                     ListView_SetItemText(pnmv->hdr.hwndFrom, pnmv->iItem, 3, arText);
-                    if (records[ri].autoRenew && !wasAuto && !IsRenewalBackgroundRunning()) {
-                        StartRenewalBackgroundThread();
-                        MessageBoxW(hw, L"已启动后台续签检查（每 6 小时自动检查）\n无需 Windows 计划任务", L"自动续签", MB_OK);
-                    }
-                    if (!records[ri].autoRenew && wasAuto) {
-                        bool anyAuto = false;
-                        for (auto& r : records) if (r.autoRenew) { anyAuto = true; break; }
-                        if (!anyAuto) StopRenewalBackgroundThread();
-                    }
+                }
                 }
             }
         }
+    } else if (msg == WM_CLOSE) {
+        // 只销毁续签窗口
+        DestroyWindow(hw);
+        return 0;
     } else if (msg == WM_DESTROY) {
         HWND hLv = GetDlgItem(hw, 100);
         if (hLv) {
@@ -838,11 +965,95 @@ LRESULT CALLBACK RenewWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
                 swprintf_s(val, L"%d", w);
                 WritePrivateProfileStringW(L"RenewalList", key, val, g_IniPath.c_str());
             }
+            // 关闭续签窗口时，把选中域名同步回主界面域名栏
+            int sel = ListView_GetNextItem(hLv, -1, LVNI_SELECTED);
+            if (sel >= 0) {
+                wchar_t domain[256] = {};
+                ListView_GetItemText(hLv, sel, 0, domain, 256);
+                if (domain[0]) {
+                    SetWindowTextW(g_hDomain, domain);
+                }
+            }
         }
+        DeleteObject((HFONT)RemovePropW(hw, L"F"));
         SetWindowLongPtrW(hw, GWLP_WNDPROC, (LONG_PTR)g_OrigRenewProc);
         g_RenewWnd = NULL;
+        // 放弃未保存的删除
+        g_PendingDeletes.clear();
+        // 刷新主界面域名下拉列表
+        RefreshDomainCombo();
+    }
+    // 统一控件背景色，消除白底
+    if (msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLORBTN) {
+        HDC dc = (HDC)wp;
+        SetBkColor(dc, GetSysColor(COLOR_3DFACE));
+        SetTextColor(dc, RGB(0, 0, 0));
+        return (LRESULT)GetSysColorBrush(COLOR_3DFACE);
     }
     return CallWindowProcW(g_OrigRenewProc, hw, msg, wp, lp);
+}
+
+// 通配符复选框 owner-draw：完全自绘，彻底消除白底
+static WNDPROC g_OrigWildcardProc = NULL;
+static LRESULT CALLBACK WildcardOwnerProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hw, &ps);
+        RECT rc; GetClientRect(hw, &rc);
+
+        // 填充背景色
+        FillRect(dc, &rc, GetSysColorBrush(COLOR_3DFACE));
+
+        // 画复选框（经典方块样式）
+        BOOL checked = (SendMessageW(hw, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        int boxSize = 16;
+        int boxY = rc.top + (rc.bottom - rc.top - boxSize) / 2;
+        RECT boxRect = { rc.left, boxY, rc.left + boxSize, boxY + boxSize };
+
+        // 外框
+        DrawEdge(dc, &boxRect, BDR_SUNKENOUTER, BF_RECT | BF_ADJUST);
+        // 内部背景白色
+        FillRect(dc, &boxRect, (HBRUSH)GetStockObject(WHITE_BRUSH));
+        // 勾选标记 — 自绘大号对勾，清晰醒目
+        if (checked) {
+            int cx = boxRect.left + (boxRect.right - boxRect.left) / 2;
+            int cy = boxRect.top + (boxRect.bottom - boxRect.top) / 2;
+            HPEN hPen = CreatePen(PS_SOLID, 2, RGB(0, 0, 0));
+            HPEN oldPen = (HPEN)SelectObject(dc, hPen);
+            // 对勾：左下 → 中下 → 右上
+            MoveToEx(dc, cx - 5, cy, NULL);
+            LineTo(dc, cx - 1, cy + 4);
+            LineTo(dc, cx + 6, cy - 5);
+            SelectObject(dc, oldPen);
+            DeleteObject(hPen);
+        }
+
+        // 画文字
+        wchar_t text[128] = {};
+        GetWindowTextW(hw, text, 128);
+        HFONT f = (HFONT)SendMessageW(hw, WM_GETFONT, 0, 0);
+        HFONT oldF = NULL;
+        if (f) oldF = (HFONT)SelectObject(dc, f);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, GetSysColor(COLOR_BTNTEXT));
+        RECT textRect = { rc.left + boxSize + 8, rc.top, rc.right, rc.bottom };
+        DrawTextW(dc, text, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        if (oldF) SelectObject(dc, oldF);
+
+        // 焦点框
+        if (GetFocus() == hw) {
+            RECT focusRect = rc;
+            InflateRect(&focusRect, -1, -1);
+            DrawFocusRect(dc, &focusRect);
+        }
+
+        EndPaint(hw, &ps);
+        return 0;
+    }
+    if (msg == WM_ERASEBKGND) {
+        return 1; // 已在 WM_PAINT 中处理背景
+    }
+    return CallWindowProcW(g_OrigWildcardProc, hw, msg, wp, lp);
 }
 
 // UI 控件句柄
@@ -1063,6 +1274,29 @@ void SyncWebRootVis() {
         SendMessageW(g_hWildcard, BM_SETCHECK, BST_UNCHECKED, 0);
 }
 
+// 刷新主界面域名下拉列表（从续签记录加载已有域名，保留当前编辑文本）
+void RefreshDomainCombo() {
+    if (!g_hDomain || !IsWindow(g_hDomain)) return;
+    // 保存当前编辑框文本
+    wchar_t curText[512] = {};
+    GetWindowTextW(g_hDomain, curText, 512);
+    // 清空并重新填充
+    SendMessageW(g_hDomain, CB_RESETCONTENT, 0, 0);
+    std::vector<RenewalRecord> records;
+    LoadRenewalRecords(records);
+    for (auto& r : records) {
+        std::wstring label = r.domain;
+        // r.domain 已包含 "*." 前缀（通配符域名在申请时已拼接），
+        // 仅对极少数缺少前缀的旧数据做兜底，避免出现 "*.*.xxx"
+        if (r.wildcard && (label.size() < 2 || label[0] != L'*' || label[1] != L'.')) {
+            label = L"*." + label;
+        }
+        SendMessageW(g_hDomain, CB_ADDSTRING, 0, (LPARAM)label.c_str());
+    }
+    // 恢复编辑框文本
+    SetWindowTextW(g_hDomain, curText);
+}
+
 // IFileDialog 事件回调,首次居中
 class DlgCenterEvents : public IFileDialogEvents {
     HWND m_owner;
@@ -1171,8 +1405,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         CreateWindowW(L"STATIC", L"域名", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE, 0, 0, 0, 0, h, (HMENU)20, 0, 0);
         SendMessageW(GetDlgItem(h, 20), WM_SETFONT, (WPARAM)f, 0);
-        g_hDomain = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, h, 0, 0, 0);
-        SendMessageW(g_hDomain, WM_SETFONT, (WPARAM)f, 0);
+g_hDomain = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWN | WS_VSCROLL | ES_AUTOHSCROLL, 0, 0, 0, 0, h, (HMENU)35, 0, 0);
+SendMessageW(g_hDomain, WM_SETFONT, (WPARAM)f, 0);
+// 子类化禁用滚轮
+SetWindowLongPtrW(g_hDomain, GWLP_USERDATA, (LONG_PTR)SetWindowLongPtrW(g_hDomain, GWLP_WNDPROC, (LONG_PTR)NoWheelComboProc));
 
         CreateWindowW(L"STATIC", L"邮箱", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE, 0, 0, 0, 0, h, (HMENU)27, 0, 0);
         SendMessageW(GetDlgItem(h, 27), WM_SETFONT, (WPARAM)f, 0);
@@ -1240,6 +1476,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 通配符复选框(DNS-01 时显示)
         g_hWildcard = CreateWindowW(L"BUTTON", L"通配符证书(*.域名)", WS_CHILD | BS_AUTOCHECKBOX, 0, 0, 0, 0, h, (HMENU)32, 0, 0);
         SendMessageW(g_hWildcard, WM_SETFONT, (WPARAM)f, 0);
+        // 子类化自绘：彻底消除视觉主题导致的白底
+        g_OrigWildcardProc = (WNDPROC)SetWindowLongPtrW(g_hWildcard, GWLP_WNDPROC, (LONG_PTR)WildcardOwnerProc);
 
         // DNS API 配置按钮(DNS-01 时显示)
         g_hBtnDnsConfig = CreateWindowW(L"BUTTON", L"DNS API 配置", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, h, (HMENU)33, 0, 0);
@@ -1296,8 +1534,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         SetPropW(h, L"F", (HANDLE)f); SetPropW(h, L"FB", (HANDLE)fb);
         SyncWebRootVis();
-        SetTimer(h, 2001, 10000, NULL);
-        SetTimer(h, 2002, 24 * 60 * 60 * 1000, NULL);
+        // 后台续签检查由 StartRenewalBackgroundThread 负责，此处不再设 Timer
         break;
     }
     case WM_SIZE: {
@@ -1377,6 +1614,20 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         mm->ptMinTrackSize.y = 560;
         return 0;
     }
+    case WM_MOVE: {
+        // 主窗口移动时，续签窗口跟随居中
+        if (g_RenewWnd && IsWindow(g_RenewWnd) && IsWindowVisible(g_RenewWnd)) {
+            RECT rcM, rcR;
+            GetWindowRect(h, &rcM);
+            GetWindowRect(g_RenewWnd, &rcR);
+            int rw = rcR.right - rcR.left;
+            int rh = rcR.bottom - rcR.top;
+            int x = rcM.left + (rcM.right - rcM.left - rw) / 2;
+            int y = rcM.top + (rcM.bottom - rcM.top - rh) / 2;
+            SetWindowPos(g_RenewWnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        }
+        break;
+    }
     case WM_COMMAND: {
         // 托盘菜单命令
         if (LOWORD(w) == IDM_SHOW) {
@@ -1443,7 +1694,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 rwc.lpfnWndProc = DefWindowProcW;
                 rwc.hInstance = (HINSTANCE)GetWindowLongPtrW(h, GWLP_HINSTANCE);
                 rwc.hCursor = LoadCursor(0, IDC_ARROW);
-                rwc.hbrBackground = CreateSolidBrush(RGB(245, 245, 245));
+                rwc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
                 rwc.lpszClassName = L"SSLClawRenew";
                 RegisterClassExW(&rwc);
                 regRenewClass = true;
@@ -1452,10 +1703,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (g_RenewWnd && IsWindow(g_RenewWnd)) { SetForegroundWindow(g_RenewWnd); break; }
 
             int rsw = 480, rsh = 300;
-            int scrw = GetSystemMetrics(SM_CXSCREEN), scrh = GetSystemMetrics(SM_CYSCREEN);
+            // 相对主窗口居中（与 DNS API 配置对话框一致）
+            RECT rcMain; GetWindowRect(h, &rcMain);
+            int rwx = rcMain.left + (rcMain.right - rcMain.left - rsw) / 2;
+            int rwy = rcMain.top + (rcMain.bottom - rcMain.top - rsh) / 2;
             g_RenewWnd = CreateWindowExW(0, L"SSLClawRenew", L"证书续签",
                 WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX & ~WS_THICKFRAME,
-                (scrw - rsw) / 2, (scrh - rsh) / 2, rsw, rsh, h, 0, 0, 0);
+                rwx, rwy, rsw, rsh, h, 0, 0, 0);
 
             // 获取客户区实际宽高，动态布局
             RECT crc; GetClientRect(g_RenewWnd, &crc);
@@ -1497,15 +1751,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             wchar_t col3[] = L"续签"; col.pszText = col3; col.cx = colW[3]; ListView_InsertColumn(hList, 3, &col);
             wchar_t col4[] = L"DNS"; col.pszText = col4; col.cx = colW[4]; ListView_InsertColumn(hList, 4, &col);
 
-            // 按钮行 - 只保留3个核心按钮，双击列表=详情，吊销在详情里
+            // 按钮行
             int btnY = padY + lvH + 6;
-            int bw = 70, bg = 10;
+            int bw = 70, bg = 8;
             int totalBtnW = 4 * bw + 3 * bg;
             int bx = (cw - totalBtnW) / 2;
-            CreateWindowW(L"BUTTON", L"刷新",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, btnY, bw, btnH, g_RenewWnd, (HMENU)102, 0, 0);
-            SendMessageW(GetDlgItem(g_RenewWnd, 102), WM_SETFONT, (WPARAM)rf, 0);
-            bx += bw + bg;
             CreateWindowW(L"BUTTON", L"续签",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, btnY, bw, btnH, g_RenewWnd, (HMENU)101, 0, 0);
             SendMessageW(GetDlgItem(g_RenewWnd, 101), WM_SETFONT, (WPARAM)rf, 0);
@@ -1514,9 +1764,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, btnY, bw, btnH, g_RenewWnd, (HMENU)104, 0, 0);
             SendMessageW(GetDlgItem(g_RenewWnd, 104), WM_SETFONT, (WPARAM)rf, 0);
             bx += bw + bg;
-            CreateWindowW(L"BUTTON", L"自动续签",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, btnY, bw, btnH, g_RenewWnd, (HMENU)103, 0, 0);
-            SendMessageW(GetDlgItem(g_RenewWnd, 103), WM_SETFONT, (WPARAM)rf, 0);
+            CreateWindowW(L"BUTTON", L"删除",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, btnY, bw, btnH, g_RenewWnd, (HMENU)105, 0, 0);
+            SendMessageW(GetDlgItem(g_RenewWnd, 105), WM_SETFONT, (WPARAM)rf, 0);
+            bx += bw + bg;
+CreateWindowW(L"BUTTON", L"保存",
+WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, btnY, bw, btnH, g_RenewWnd, (HMENU)108, 0, 0);
+            SendMessageW(GetDlgItem(g_RenewWnd, 108), WM_SETFONT, (WPARAM)rf, 0);
 
             // 状态栏 - 紧贴底部，左边记录数，右边 Web 服务器检测
             int stY = btnY + btnH + 8;
@@ -1538,6 +1792,34 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             ShowWindow(g_RenewWnd, SW_SHOW);
             // 初始加载
             SendMessageW(g_RenewWnd, WM_USER+1, 0, 0);
+            // 同步主界面域名到续签窗口：选中匹配的记录
+            {
+                wchar_t curDomain[256] = {};
+                GetWindowTextW(g_hDomain, curDomain, 256);
+                if (curDomain[0]) {
+                    HWND hLv = GetDlgItem(g_RenewWnd, 100);
+                    if (hLv) {
+                        // 续签列表域名列显示 r.domain（通配符已含 "*." 前缀），
+                        // 因此同时匹配完整域名和剥离前缀的版本
+                        std::wstring findDomain = curDomain;
+                        std::wstring stripped = findDomain;
+                        if (stripped.size() >= 2 && stripped[0] == L'*' && stripped[1] == L'.')
+                            stripped = stripped.substr(2);
+                        int cnt = ListView_GetItemCount(hLv);
+                        for (int i = 0; i < cnt; i++) {
+                            wchar_t d[256] = {};
+                            ListView_GetItemText(hLv, i, 0, d, 256);
+                            if (_wcsicmp(d, findDomain.c_str()) == 0 ||
+                                _wcsicmp(d, stripped.c_str()) == 0) {
+                                ListView_SetItemState(hLv, -1, 0, LVIS_SELECTED);
+                                ListView_SetItemState(hLv, i, LVIS_SELECTED, LVIS_SELECTED);
+                                ListView_EnsureVisible(hLv, i, FALSE);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
         else if (HIWORD(w) == CBN_SELCHANGE && (HWND)l == g_hVerifyMode) {
             static DWORD lastSwitchTick = 0;
@@ -1551,14 +1833,57 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SendMessageW(g_hLog, EM_SETSEL, 0, 0);
             SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
         }
+        else if (HIWORD(w) == CBN_SELCHANGE && (HWND)l == g_hDomain) {
+            // 域名下拉框选中切换时，联动通配符复选框并加载 DNS 配置
+            // CBS_DROPDOWN 下拉选择后，用 CB_GETCURSEL+CB_GETLBTEXT 取选中项文本
+            int sel = (int)SendMessageW(g_hDomain, CB_GETCURSEL, 0, 0);
+            wchar_t domainBuf[512] = {};
+            if (sel >= 0) {
+                SendMessageW(g_hDomain, CB_GETLBTEXT, sel, (LPARAM)domainBuf);
+            } else {
+                // 无选中项（用户手动输入），取编辑框文本
+                GetWindowTextW(g_hDomain, domainBuf, 512);
+            }
+            if (domainBuf[0]) {
+                // 域名以 "*." 开头 → 勾选通配符，并确保 DNS-01 验证模式
+                bool isWildcard = (wcslen(domainBuf) >= 2 && domainBuf[0] == L'*' && domainBuf[1] == L'.');
+                if (isWildcard) {
+                    if ((int)SendMessageW(g_hVerifyMode, CB_GETCURSEL, 0, 0) != 1) {
+                        SendMessageW(g_hVerifyMode, CB_SETCURSEL, 1, 0);
+                        SyncWebRootVis();
+                    }
+                    if (g_hWildcard) {
+                        SendMessageW(g_hWildcard, BM_SETCHECK, BST_CHECKED, 0);
+                        // 自绘复选框需手动触发重绘
+                        InvalidateRect(g_hWildcard, NULL, TRUE);
+                        UpdateWindow(g_hWildcard);
+                    }
+                } else {
+                    // 非通配符域名 → 取消勾选
+                    if (g_hWildcard) {
+                        SendMessageW(g_hWildcard, BM_SETCHECK, BST_UNCHECKED, 0);
+                        InvalidateRect(g_hWildcard, NULL, TRUE);
+                        UpdateWindow(g_hWildcard);
+                    }
+                }
+                LoadDnsConfigForDomain(domainBuf);
+            }
+        }
         else if ((HWND)l == g_hIP && HIWORD(w) == 0) {
             // 点击复制当前显示的IP(不含"本机IP: "前缀)
             if (g_ipIndex < (int)g_ipList.size()) {
                 const std::wstring& ip = g_ipList[g_ipIndex];
                 OpenClipboard(NULL); EmptyClipboard();
                 HGLOBAL hm = GlobalAlloc(GMEM_MOVEABLE, (ip.size() + 1) * sizeof(wchar_t));
-                memcpy(GlobalLock(hm), ip.c_str(), (ip.size() + 1) * sizeof(wchar_t));
-                GlobalUnlock(hm); SetClipboardData(CF_UNICODETEXT, hm);
+                if (hm) {
+                    void* pLock = GlobalLock(hm);
+                    if (pLock) {
+                        memcpy(pLock, ip.c_str(), (ip.size() + 1) * sizeof(wchar_t));
+                        GlobalUnlock(hm); SetClipboardData(CF_UNICODETEXT, hm);
+                    } else {
+                        GlobalFree(hm);
+                    }
+                }
                 CloseClipboard(); SetStatus(L"IP 已复制");
             }
         }
@@ -1577,7 +1902,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             tc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_ENABLE_HYPERLINKS;
             tc.pszWindowTitle = L"关于 SSLClaw";
             tc.pszMainIcon = TD_INFORMATION_ICON;
-            tc.pszMainInstruction = L"SSLClaw v1.1.1";
+            tc.pszMainInstruction = L"SSLClaw v1.1.2";
             tc.pszContent = L"Windows SSL 证书管理工具\n基于 ACME 协议自动申请和续签 Let's Encrypt 证书\n\n作者:DiskClaw\n<a href=\"https://github.com/DiskClaw/SSLClaw\">https://github.com/DiskClaw/SSLClaw</a>";
             tc.pfCallback = cb;
             TaskDialogIndirect(&tc, NULL, NULL, NULL);
@@ -1591,21 +1916,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             wchar_t display[128];
             swprintf_s(display, L"本机IP: %s", g_ipList[g_ipIndex].c_str());
             SetWindowTextW(g_hIP, display);
-        }
-        if (w == 2001) {
-            KillTimer(h, 2001);
-            HANDLE ht = (HANDLE)_beginthreadex(0, 0, [](void*)->unsigned {
-                RunRenewalMode();
-                return 0;
-            }, 0, 0, 0);
-            if (ht) CloseHandle(ht);
-        }
-        if (w == 2002) {
-            HANDLE ht = (HANDLE)_beginthreadex(0, 0, [](void*)->unsigned {
-                RunRenewalMode();
-                return 0;
-            }, 0, 0, 0);
-            if (ht) CloseHandle(ht);
         }
         break;
     }
@@ -1646,7 +1956,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w;
-        SetBkColor(dc, RGB(245, 245, 245));
+        SetBkColor(dc, GetSysColor(COLOR_3DFACE));
         HWND ctrl = (HWND)l;
         if (ctrl == g_hCAStatus) {
             if (g_caStatus == 1) SetTextColor(dc, RGB(0, 150, 60));
@@ -1658,6 +1968,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SetTextColor(dc, RGB(0, 0, 0));
         }
         return (LRESULT)GetClassLongPtrW(h, GCLP_HBRBACKGROUND);
+    }
+    case WM_CTLCOLORBTN: {
+        // 复选框/单选按钮背景与窗口一致，消除白块
+        HDC dc = (HDC)w;
+        SetBkColor(dc, GetSysColor(COLOR_3DFACE));
+        SetTextColor(dc, RGB(0, 0, 0));
+        return (LRESULT)GetSysColorBrush(COLOR_3DFACE);
     }
     case WM_CLOSE: {
         // 有关闭标志才真退出，否则最小化到托盘
@@ -1765,8 +2082,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 清理托盘图标
         if (g_TrayVisible) { Shell_NotifyIconW(NIM_DELETE, &g_TrayNid); g_TrayVisible = false; }
         KillTimer(h, IP_TIMER_ID);
-        KillTimer(h, 2001);
-        KillTimer(h, 2002);
         wchar_t buf[512];
         if (GetWindowTextW(g_hDomain, buf, 512)) WritePrivateProfileStringW(L"SSLClaw", L"Domain", buf, g_IniPath.c_str());
         if (GetWindowTextW(g_hEmail, buf, 512)) WritePrivateProfileStringW(L"SSLClaw", L"Email", buf, g_IniPath.c_str());

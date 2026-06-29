@@ -105,9 +105,9 @@ bool WriteFileAtomic(const std::string& path, const std::string& content) {
         HANDLE h = CreateFileW(wTmp.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h == INVALID_HANDLE_VALUE) return false;
         DWORD written = 0;
-        WriteFile(h, content.data(), (DWORD)content.size(), &written, NULL);
+        BOOL ok = WriteFile(h, content.data(), (DWORD)content.size(), &written, NULL);
         CloseHandle(h);
-        if (written != (DWORD)content.size()) { _wunlink(wTmp.c_str()); return false; }
+        if (!ok || written != (DWORD)content.size()) { _wunlink(wTmp.c_str()); return false; }
     }
     if (!MoveFileExW(wTmp.c_str(), wPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         _wunlink(wTmp.c_str()); return false;
@@ -234,13 +234,18 @@ std::string ProtectString(const std::string& clearText) {
     const char* magic = "aes1"; blob.insert(blob.end(), magic, magic + 4);
     blob.insert(blob.end(), iv.begin(), iv.end());
     blob.insert(blob.end(), cipher.begin(), cipher.end());
-    // Base64
+    // Base64（CRYPT_STRING_NOCRLF 仍可能在 64 字符处换行，需彻底去除所有 \r \n）
     DWORD b64len = 0;
     CryptBinaryToStringA(blob.data(), (DWORD)blob.size(), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &b64len);
     std::string b64; b64.resize(b64len);
     CryptBinaryToStringA(blob.data(), (DWORD)blob.size(), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &b64[0], &b64len);
-    while (!b64.empty() && (b64.back() == '\0' || b64.back() == '\r' || b64.back() == '\n')) b64.pop_back();
-    return "aes-" + b64;
+    // 去除所有 \r \n \0（不仅是尾部，CryptBinaryToStringA 可能在 64 字符边界插入换行）
+    std::string clean64;
+    clean64.reserve(b64.size());
+    for (char c : b64) {
+        if (c != '\r' && c != '\n' && c != '\0') clean64 += c;
+    }
+    return "aes-" + clean64;
 }
 
 std::string UnprotectString(const std::string& protectedText) {
@@ -283,46 +288,59 @@ std::string UnprotectString(const std::string& protectedText) {
     return std::string(plain.begin(), plain.end());
 }
 
-void EnsureIniUtf16(const wchar_t* iniPath) {
+void EnsureIniUtf8(const wchar_t* iniPath) {
     HANDLE hFile = CreateFileW(iniPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
-        WORD bom = 0;
+        BYTE hdr[3] = {};
         DWORD read = 0;
-        ReadFile(hFile, &bom, 2, &read, NULL);
-        CloseHandle(hFile);
-        if (read >= 2 && bom == 0xFEFF) return;
-        hFile = CreateFileW(iniPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) return;
-        DWORD fileSize = GetFileSize(hFile, NULL);
-        if (fileSize == 0 || fileSize > 1024 * 1024) { CloseHandle(hFile); return; }
-        std::vector<BYTE> data(fileSize);
-        DWORD totalRead = 0;
-        ReadFile(hFile, data.data(), fileSize, &totalRead, NULL);
-        CloseHandle(hFile);
-        int wlen = MultiByteToWideChar(CP_ACP, 0, (const char*)data.data(), totalRead, NULL, 0);
-        if (wlen <= 0) return;
-        std::vector<WCHAR> wdata(wlen);
-        MultiByteToWideChar(CP_ACP, 0, (const char*)data.data(), totalRead, wdata.data(), wlen);
-        hFile = CreateFileW(iniPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) return;
-        WORD bomW = 0xFEFF;
-        DWORD written = 0;
-        WriteFile(hFile, &bomW, 2, &written, NULL);
-        WriteFile(hFile, wdata.data(), (DWORD)(wlen * sizeof(WCHAR)), &written, NULL);
+        ReadFile(hFile, hdr, 3, &read, NULL);
+        // 已经是 UTF-8 BOM，无需处理
+        if (read >= 3 && hdr[0] == 0xEF && hdr[1] == 0xBB && hdr[2] == 0xBF) {
+            CloseHandle(hFile); return;
+        }
+        // UTF-16 LE BOM → 转换为 UTF-8
+        if (read >= 2 && hdr[0] == 0xFF && hdr[1] == 0xFE) {
+            CloseHandle(hFile);
+            hFile = CreateFileW(iniPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            if (hFile == INVALID_HANDLE_VALUE) return;
+            DWORD fileSize = GetFileSize(hFile, NULL);
+            if (fileSize < 2 || fileSize > 1024 * 1024) { CloseHandle(hFile); return; }
+            std::vector<BYTE> data(fileSize);
+            DWORD totalRead = 0;
+            ReadFile(hFile, data.data(), fileSize, &totalRead, NULL);
+            CloseHandle(hFile);
+            // 跳过 BOM，将 UTF-16 LE 转为 UTF-8
+            int wlen = (int)((totalRead - 2) / 2);
+            if (wlen <= 0) return;
+            int ulen = WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)(data.data() + 2), wlen, NULL, 0, NULL, NULL);
+            if (ulen <= 0) return;
+            std::string utf8(ulen, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)(data.data() + 2), wlen, &utf8[0], ulen, NULL, NULL);
+            hFile = CreateFileW(iniPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile == INVALID_HANDLE_VALUE) return;
+            DWORD written = 0;
+            BYTE bom8[3] = { 0xEF, 0xBB, 0xBF };
+            WriteFile(hFile, bom8, 3, &written, NULL);
+            WriteFile(hFile, utf8.data(), (DWORD)utf8.size(), &written, NULL);
+            CloseHandle(hFile);
+            return;
+        }
+        // ANSI 或其他编码，不处理
         CloseHandle(hFile);
         return;
     }
+    // 文件不存在，创建新文件并写入 UTF-8 BOM
     hFile = CreateFileW(iniPath, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
-        WORD bom = 0xFEFF;
+        BYTE bom8[3] = { 0xEF, 0xBB, 0xBF };
         DWORD written;
-        WriteFile(hFile, &bom, 2, &written, NULL);
+        WriteFile(hFile, bom8, 3, &written, NULL);
         CloseHandle(hFile);
     }
 }
 
 void WriteProtectedProfileStringW(const wchar_t* iniPath, const wchar_t* section, const wchar_t* key, const std::wstring& value) {
-    EnsureIniUtf16(iniPath);
+    EnsureIniUtf8(iniPath);
     if (value.empty()) { WritePrivateProfileStringW(section, key, L"", iniPath); return; }
     std::string clear = W2A(value);
     std::string protectedStr = ProtectString(clear);
@@ -330,7 +348,7 @@ void WriteProtectedProfileStringW(const wchar_t* iniPath, const wchar_t* section
 }
 
 std::wstring GetProtectedProfileStringW(const wchar_t* iniPath, const wchar_t* section, const wchar_t* key, const wchar_t* def) {
-    EnsureIniUtf16(iniPath);
+    EnsureIniUtf8(iniPath);
     wchar_t buf[4096];
     GetPrivateProfileStringW(section, key, L"", buf, 4096, iniPath);
     std::string stored = W2A(buf);
@@ -359,7 +377,7 @@ void SendNotificationEmail(const std::wstring& subject, const std::wstring& body
     std::wstring smtpTo = buf;
     if (smtpFrom.empty() || smtpTo.empty()) return;
 
-    // 安全方案：使用临时 PowerShell 脚本文件而不是直接命令拼接，避免命令注入
+    // 安全方案：通过环境变量传递 SMTP 密码，避免明文写入临时脚本文件
     std::wstring tempScriptPath = saveDir + L"\\sslclaw_temp_mail.ps1";
     std::string scriptContent;
 
@@ -376,18 +394,25 @@ void SendNotificationEmail(const std::wstring& subject, const std::wstring& body
         return result;
     };
 
+    // 密码通过环境变量传递，脚本中不出现明文密码
     scriptContent = "$ErrorActionPreference = 'Stop'\n";
-    scriptContent += "$secpass = ConvertTo-SecureString -String '" + EscapeSingleQuote(smtpPass) + "' -AsPlainText -Force\n";
+    scriptContent += "$smtpPass = $env:SSLCLAW_SMTP_PASS\n";
+    scriptContent += "$secpass = ConvertTo-SecureString -String $smtpPass -AsPlainText -Force\n";
     scriptContent += "$cred = New-Object System.Management.Automation.PSCredential('" + EscapeSingleQuote(smtpUser) + "', $secpass)\n";
     scriptContent += "Send-MailMessage -SmtpServer '" + EscapeSingleQuote(smtpServer) + "' -Port " + std::to_string(smtpPort) + "\n";
     scriptContent += "  -From '" + EscapeSingleQuote(smtpFrom) + "' -To '" + EscapeSingleQuote(smtpTo) + "'\n";
     scriptContent += "  -Subject '" + EscapeSingleQuote(subject) + "' -Body '" + EscapeSingleQuote(body) + "'\n";
     scriptContent += "  -Credential $cred\n";
+    scriptContent += "Remove-Item Env:SSLCLAW_SMTP_PASS\n";
 
     // 写入临时脚本文件（原子写入）
     if (!WriteFileAtomic(W2A(tempScriptPath), scriptContent)) {
         return;
     }
+
+    // 设置密码环境变量（仅当前进程，子进程继承）
+    std::wstring envPass = L"SSLCLAW_SMTP_PASS=" + smtpPass;
+    _wputenv_s(L"SSLCLAW_SMTP_PASS", smtpPass.c_str());
 
     // 执行临时脚本
     std::wstring cmd = L"powershell.exe -ExecutionPolicy Bypass -File \"" + tempScriptPath + L"\"";
@@ -395,13 +420,15 @@ void SendNotificationEmail(const std::wstring& subject, const std::wstring& body
     PROCESS_INFORMATION pi = {};
     CreateProcessW(NULL, (wchar_t*)cmd.c_str(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     if (pi.hProcess) { 
-        WaitForSingleObject(pi.hProcess, 30000); 
+        DWORD wr = WaitForSingleObject(pi.hProcess, 30000);
+        if (wr == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hProcess); 
         CloseHandle(pi.hThread); 
     }
 
-    // 清理临时文件
+    // 清理临时文件和环境变量
     DeleteFileW(tempScriptPath.c_str());
+    _wputenv_s(L"SSLCLAW_SMTP_PASS", L"");
 }
 
 // ── HMAC 辅助函数（DNS API 签名用） ──

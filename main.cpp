@@ -11,6 +11,10 @@ static LONG WINAPI SSLClawExceptionFilter(EXCEPTION_POINTERS* ep) {
     wcscat_s(path, L"\\crash.log");
     HANDLE hf = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hf != INVALID_HANDLE_VALUE) {
+        // 首次创建时写入 UTF-16 LE BOM，与 sslclaw.log 保持一致
+        if (GetFileSize(hf, NULL) == 0) {
+            DWORD w; WriteFile(hf, "\xFF\xFE", 2, &w, NULL);
+        }
         SYSTEMTIME st; GetLocalTime(&st);
         wchar_t line[256];
         int n = swprintf_s(line, L"[%04d-%02d-%02d %02d:%02d:%02d] Exception code: 0x%08X at 0x%p\r\n",
@@ -60,8 +64,9 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     // GUI 模式进程唯一：防止多开
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"SSLClaw_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND existing = FindWindowW(L"S", NULL);
+        HWND existing = FindWindowW(L"SSLClawMainWnd", NULL);
         if (existing) { SetForegroundWindow(existing); ShowWindow(existing, SW_RESTORE); }
+        CloseHandle(hMutex);
         return 0;
     }
 
@@ -85,8 +90,8 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     extern std::wstring g_LogFilePath;
     g_LogFilePath = exePath; g_LogFilePath += L"sslclaw.log";
 
-    // 先确保 sslclaw.ini 是 UTF-16 LE BOM，再进行任何 INI 操作
-    EnsureIniUtf16(g_IniPath.c_str());
+    // 确保 sslclaw.ini 为 UTF-8 BOM（兼容旧 UTF-16 格式自动转换）
+    EnsureIniUtf8(g_IniPath.c_str());
 
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -95,12 +100,13 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(1));
     wc.hIconSm = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
     wc.hCursor = LoadCursor(0, IDC_ARROW);
-    wc.hbrBackground = CreateSolidBrush(RGB(245, 245, 245));
-    wc.lpszClassName = L"S";
+    // 使用系统画刷避免 GDI 句柄泄漏（GetSysColorBrush 返回的画刷由系统管理，无需 DeleteObject）
+    wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
+    wc.lpszClassName = L"SSLClawMainWnd";
     RegisterClassExW(&wc);
 
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-    g_hWnd = CreateWindowExW(WS_EX_CONTEXTHELP, L"S", L"SSLClaw 证书申请工具",
+    g_hWnd = CreateWindowExW(WS_EX_CONTEXTHELP, L"SSLClawMainWnd", L"SSLClaw 证书申请工具",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX & ~WS_THICKFRAME,
         (sw - 480) / 2, max(0, (sh - 560) / 2), 480, 560, 0, 0, hInstance, 0);
 
@@ -139,8 +145,8 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
             SetWindowTextW(g_hWebRoot, buf);
         }
         // 恢复通配符复选框
-        int wc = GetPrivateProfileIntW(L"SSLClaw", L"Wildcard", 0, g_IniPath.c_str());
-        SendMessageW(g_hWildcard, BM_SETCHECK, wc ? BST_CHECKED : BST_UNCHECKED, 0);
+        int wildcardChecked = GetPrivateProfileIntW(L"SSLClaw", L"Wildcard", 0, g_IniPath.c_str());
+        SendMessageW(g_hWildcard, BM_SETCHECK, wildcardChecked ? BST_CHECKED : BST_UNCHECKED, 0);
         // 加载 DNS API 配置（按当前域名加载，无域名则加载默认）
         {
             wchar_t domainBuf[512];
@@ -158,8 +164,16 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
         std::vector<RenewalRecord> records;
         LoadRenewalRecords(records);
         bool hasAutoRenew = false;
-        for (auto& r : records) if (r.autoRenew) { hasAutoRenew = true; break; }
+        for (auto& r : records) {
+            if (r.autoRenew) {
+                hasAutoRenew = true;
+                Log(L"[启动] 续签记录 %s 的 autoRenew=1，将启动后台续签线程", r.domain.c_str());
+            }
+        }
         if (hasAutoRenew) StartRenewalBackgroundThread();
+        else Log(L"[启动] 无自动续签记录，不启动后台线程");
+        // 刷新主界面域名下拉列表（从续签记录加载已有域名）
+        RefreshDomainCombo();
     }
 
     MSG msg;
@@ -175,5 +189,6 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
 
     WSACleanup();
     CoUninitialize();
+    CloseHandle(hMutex);
     return 0;
 }

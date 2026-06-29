@@ -64,6 +64,7 @@ void SyncWebRootVis();
 void ShowVerifySteps(int vm);
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l);
 void ShowDnsConfigDialog(HWND hwParent, const std::wstring& overrideDomain = std::wstring());
+void RefreshDomainCombo();
 
 // DNS API 配置（供 ssl_core.cpp 读取）
 extern int g_DnsProvider;

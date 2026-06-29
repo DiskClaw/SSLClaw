@@ -2,13 +2,9 @@
 #include "ssl_core.h"
 #include "ssl_keyfmt.h"
 
+// Log 未在 ssl_core.h 中声明，保留 extern
 extern void Log(const wchar_t* fmt, ...);
-extern bool WriteFileAtomic(const std::string& path, const std::string& content);
-
-// 外部全局变量
-extern BCRYPT_KEY_HANDLE g_AccKey;
-extern std::string g_AccPubB64, g_AccExpB64;
-extern std::string g_AccURL;
+// WriteFileAtomic、g_AccKey、g_AccPubB64、g_AccExpB64、g_AccURL 已在 ssl_core.h 中声明
 
 // ── DER 长度编码 ──
 static void DerLenAppend(std::vector<BYTE>& out, size_t len) {

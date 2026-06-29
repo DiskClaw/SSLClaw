@@ -1,18 +1,10 @@
 // ssl_dnsapi.cpp - DNS 提供商 API（阿里云、腾讯云、Cloudflare）
 #include "ssl_core.h"
 
+// Log 未在 ssl_core.h 中声明，保留 extern
 extern void Log(const wchar_t* fmt, ...);
-extern std::string DnsHttp(const std::string& url, const std::string& method,
-    const std::string& contentType, const std::string& body,
-    const std::vector<std::pair<std::string, std::string>>& headers);
-extern std::vector<BYTE> HmacSha1(const std::string& key, const std::string& data);
-extern std::vector<BYTE> HmacSha256Raw(const std::string& key, const std::string& data);
-extern std::vector<BYTE> HmacSha256Raw(const std::vector<BYTE>& key, const std::string& data);
-extern std::string Sha256Hex(const std::string& data);
-extern std::string Sha256B64(const std::string& data);
-extern std::string JsonStr(const std::string& json, const char* key);
-extern std::string W2A(const std::wstring& w);
-extern std::wstring A2W(const std::string& a);
+// 其余函数（DnsHttp, HmacSha1, HmacSha256Raw, Sha256Hex, Sha256B64, JsonStr, W2A, A2W 等）
+// 已统一声明在 ssl_core.h 中，不再需要 extern
 
 // ── 通用 DNS TXT 验证 ──
 bool DnsTxtExists(const std::wstring& queryName) {
@@ -277,6 +269,17 @@ std::wstring DnsFindZone(int provider, const std::wstring& apiId, const std::wst
 
     if (provider == DNS_PROVIDER_ALIYUN) {
         std::string rsp = AliyunDnsApi("DescribeDomains", W2A(apiId), W2A(apiSecret), { {"PageSize", "100"} });
+        if (rsp.empty()) {
+            Log(L"[DNS] 阿里云 API 返回空响应，请检查 API 密钥和网络连接");
+            return L"";
+        }
+        // 检查 API 错误响应
+        std::string errCode = JsonStr(rsp, "Code");
+        if (!errCode.empty()) {
+            std::string errMsg = JsonStr(rsp, "Message");
+            Log(L"[DNS] 阿里云 API 错误: %s - %s", A2W(errCode).c_str(), A2W(errMsg).c_str());
+            return L"";
+        }
         size_t p = 0;
         while (true) {
             p = rsp.find("\"DomainName\":\"", p);
@@ -292,9 +295,23 @@ std::wstring DnsFindZone(int provider, const std::wstring& apiId, const std::wst
             allZones.push_back(zi);
             p = e;
         }
+        if (allZones.empty()) {
+            Log(L"[DNS] 阿里云 API 未返回任何域名，请确认账号下有已注册的域名");
+        }
     }
     else if (provider == DNS_PROVIDER_TENCENT) {
         std::string rsp = TencentDnsApi("DescribeDomainList", W2A(apiId), W2A(apiSecret), {});
+        if (rsp.empty()) {
+            Log(L"[DNS] 腾讯云 API 返回空响应，请检查 API 密钥和网络连接");
+            return L"";
+        }
+        // 检查 API 错误响应
+        std::string errCode = JsonStr(rsp, "Code");
+        if (!errCode.empty() && errCode != "\"") {
+            std::string errMsg = JsonStr(rsp, "Message");
+            Log(L"[DNS] 腾讯云 API 错误: %s - %s", A2W(errCode).c_str(), A2W(errMsg).c_str());
+            return L"";
+        }
         size_t p = 0;
         while (true) {
             p = rsp.find("\"Name\":\"", p);
@@ -310,12 +327,28 @@ std::wstring DnsFindZone(int provider, const std::wstring& apiId, const std::wst
             allZones.push_back(zi);
             p = e;
         }
+        if (allZones.empty()) {
+            Log(L"[DNS] 腾讯云 API 未返回任何域名，请确认账号下有已注册的域名");
+        }
     }
     else if (provider == DNS_PROVIDER_CLOUDFLARE) {
         std::string rsp = CfDnsApi(apiSecret, "GET", "zones?per_page=100", "");
+        if (rsp.empty()) {
+            Log(L"[DNS] Cloudflare API 返回空响应，请检查 API Token 和网络连接");
+            return L"";
+        }
+        // 检查 API 错误响应
+        if (rsp.find("\"success\":false") != std::string::npos) {
+            std::string errMsg = JsonStr(rsp, "message");
+            Log(L"[DNS] Cloudflare API 错误: %s", A2W(errMsg).c_str());
+            return L"";
+        }
         // 找到 result 数组起始，避免解析外层容器的 id/name
         size_t arrStart = rsp.find("\"result\":[");
-        if (arrStart == std::string::npos) return L"";
+        if (arrStart == std::string::npos) {
+            Log(L"[DNS] Cloudflare API 响应格式异常，未找到 result 数组");
+            return L"";
+        }
         arrStart += 10; // skip "result":[
         size_t p = arrStart;
         while (true) {
@@ -342,6 +375,9 @@ std::wstring DnsFindZone(int provider, const std::wstring& apiId, const std::wst
             allZones.push_back(zi);
             
             p = nameEnd;
+        }
+        if (allZones.empty()) {
+            Log(L"[DNS] Cloudflare API 未返回任何域名，请确认 Token 有 Zone:Read 权限且账号下有已注册的域名");
         }
     }
 
@@ -378,6 +414,19 @@ std::wstring DnsFindZone(int provider, const std::wstring& apiId, const std::wst
         } else {
             std::string sub = domain.substr(0, domain.size() - suffix.size());
             outSubDomain = A2W(sub);
+        }
+    } else {
+        // 未找到匹配的 Zone，列出已有域名供用户参考
+        Log(L"[DNS] 未找到匹配 %s 的 Zone（查询名: %s）", A2W(domain).c_str(), recordName.c_str());
+        if (allZones.empty()) {
+            Log(L"[DNS] 账号下无任何域名，请检查 API 密钥是否正确");
+        } else {
+            std::wstring zoneList;
+            for (size_t i = 0; i < allZones.size() && i < 10; i++) {
+                if (i > 0) zoneList += L", ";
+                zoneList += allZones[i].name;
+            }
+            Log(L"[DNS] 账号下已有域名: %s", zoneList.c_str());
         }
     }
     return bestZone.name;
