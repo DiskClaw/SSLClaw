@@ -35,4 +35,4 @@ jobs:
         files: |
           x64/Release/SSLClaw.exe
           SSLClaw_${{ github.ref_name }}.zip
-        body: "版本1.1.2\n修复自动续签误触发（阈值60天改7天，动态检查间隔）\n增强DNS TXT记录异常安全清理（RAII守卫）\n续签界面交互优化（删除后悔机制、保存反馈改为状态栏）\n\n正式/测试环境点击切换（先测试再正式避免acme限速）\nDNS API 自动验证（阿里云/腾讯云/Cloudflare）"
+        body: "版本1.1.2\nGLM 5.2 模型\n修复自动续签误触发（阈值60天改7天，动态检查间隔）\n增强DNS TXT记录异常安全清理（RAII守卫）\n续签界面交互优化"

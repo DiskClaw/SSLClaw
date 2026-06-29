@@ -151,6 +151,9 @@ bool SaveRenewalRecords(const std::vector<RenewalRecord>& records);
 int FindRenewalByDomain(const std::vector<RenewalRecord>& records, const std::wstring& domain);
 void AddOrUpdateRenewal(const RenewalRecord& record);
 
+// 从磁盘证书文件读取实际到期时间
+FILETIME ReadCertExpiryFromDisk(const RenewalRecord& rec);
+
 // 续签检查（返回需要续签的记录索引列表）
 std::vector<int> GetRenewalsDue(const std::vector<RenewalRecord>& records);
 

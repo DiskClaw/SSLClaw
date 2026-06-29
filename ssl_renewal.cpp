@@ -61,7 +61,7 @@ struct RenewalRetryState {
 static std::vector<RenewalRetryState> g_RetryStates;
 
 // ── 从磁盘证书文件读取实际到期时间 ──
-static FILETIME ReadCertExpiryFromDisk(const RenewalRecord& rec) {
+FILETIME ReadCertExpiryFromDisk(const RenewalRecord& rec) {
     FILETIME expFt = {};
     if (rec.saveDir.empty() || rec.domain.empty()) return expFt;
 
@@ -240,6 +240,10 @@ bool LoadRenewalRecords(std::vector<RenewalRecord>& records) {
     DWORD len = GetPrivateProfileSectionNamesW(secBuf, 32768, ini.c_str());
     if (len == 0) return true;
 
+    // 先读取主配置目录，用于覆盖所有记录的 saveDir
+    wchar_t mainSaveDir[2048];
+    GetPrivateProfileStringW(L"SSLClaw", L"SaveDir", L"", mainSaveDir, 2048, ini.c_str());
+
     const wchar_t* p = secBuf;
     while (*p) {
         std::wstring sec(p);
@@ -254,6 +258,8 @@ bool LoadRenewalRecords(std::vector<RenewalRecord>& records) {
             rec.serverType = _wtoi(buf);
             GetPrivateProfileStringW(sec.c_str(), L"webRoot", L"", buf, 2048, ini.c_str()); rec.webRoot = buf;
             GetPrivateProfileStringW(sec.c_str(), L"saveDir", L"", buf, 2048, ini.c_str()); rec.saveDir = buf;
+            // 用主配置目录覆盖，确保证书从当前目录读取
+            if (mainSaveDir[0]) rec.saveDir = mainSaveDir;
             GetPrivateProfileStringW(sec.c_str(), L"email", L"", buf, 2048, ini.c_str()); rec.email = buf;
             GetPrivateProfileStringW(sec.c_str(), L"autoRenew", L"0", buf, 2048, ini.c_str()); rec.autoRenew = (wcscmp(buf, L"1") == 0);
             GetPrivateProfileStringW(sec.c_str(), L"thumbprint", L"", buf, 2048, ini.c_str()); rec.thumbprint = buf;
@@ -270,14 +276,15 @@ bool LoadRenewalRecords(std::vector<RenewalRecord>& records) {
             GetPrivateProfileStringW(sec.c_str(), L"wildcard", L"0", buf, 2048, ini.c_str()); rec.wildcard = (wcscmp(buf, L"1") == 0);
             GetPrivateProfileStringW(sec.c_str(), L"dnsProvider", L"0", buf, 2048, ini.c_str()); rec.dnsProvider = _wtoi(buf);
 
-            // 从磁盘证书读取实际到期时间，优先于 INI
+            // 从磁盘证书读取实际到期时间（saveDir 已更新为新目录）
             FILETIME diskExp = ReadCertExpiryFromDisk(rec);
             if (diskExp.dwLowDateTime || diskExp.dwHighDateTime) rec.expiryTime = diskExp;
 
             if (!rec.domain.empty()) records.push_back(rec);
         }
-        p += wcslen(p) + 1;  // #9: 正确的推进方式（字符数，非字节数）
+        p += wcslen(p) + 1;
     }
+
     return !records.empty();
 }
 

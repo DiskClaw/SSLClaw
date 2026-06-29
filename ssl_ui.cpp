@@ -852,15 +852,29 @@ LRESULT CALLBACK RenewWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == 1) MessageBoxW(hw, L"续签成功", L"提示", MB_OK);
         else MessageBoxW(hw, L"续签失败，请查看日志", L"错误", MB_ICONERROR);
     } else if (msg == WM_USER+1) {
-        // 刷新列表 - 基于 RenewalRecord，不扫 Certificate Store
+        // 刷新列表
         HWND hL = GetDlgItem(hw, 100);
         HWND hSt = GetDlgItem(hw, 106);
-        // 抑制 LVN_ITEMCHANGED，防止刷新时误触发 autoRenew 逻辑
         g_SuppressCheckEvent = TRUE;
         ListView_DeleteAllItems(hL);
 
         std::vector<RenewalRecord> records;
         LoadRenewalRecords(records);
+
+        // 从主界面编辑框实时读取保存目录，覆盖记录中的旧目录
+        wchar_t curSaveDir[MAX_PATH] = {};
+        if (g_hSaveDirEdit) GetWindowTextW(g_hSaveDirEdit, curSaveDir, MAX_PATH);
+        if (curSaveDir[0]) {
+            for (auto& r : records) r.saveDir = curSaveDir;
+        }
+
+        // 从磁盘证书文件读取实际到期时间，覆盖 INI 中的旧值
+        for (auto& r : records) {
+            FILETIME diskExp = ReadCertExpiryFromDisk(r);
+            if (diskExp.dwLowDateTime || diskExp.dwHighDateTime)
+                r.expiryTime = diskExp;
+        }
+
         if (records.empty()) {
             SetWindowTextW(hSt, L"暂无续签记录，请先通过主界面申请证书");
             g_SuppressCheckEvent = FALSE;
@@ -1834,36 +1848,53 @@ WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, btnY, bw, btnH, g_RenewWnd, (HMENU)10
             SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
         }
         else if (HIWORD(w) == CBN_SELCHANGE && (HWND)l == g_hDomain) {
-            // 域名下拉框选中切换时，联动通配符复选框并加载 DNS 配置
-            // CBS_DROPDOWN 下拉选择后，用 CB_GETCURSEL+CB_GETLBTEXT 取选中项文本
             int sel = (int)SendMessageW(g_hDomain, CB_GETCURSEL, 0, 0);
             wchar_t domainBuf[512] = {};
             if (sel >= 0) {
                 SendMessageW(g_hDomain, CB_GETLBTEXT, sel, (LPARAM)domainBuf);
             } else {
-                // 无选中项（用户手动输入），取编辑框文本
                 GetWindowTextW(g_hDomain, domainBuf, 512);
             }
             if (domainBuf[0]) {
-                // 域名以 "*." 开头 → 勾选通配符，并确保 DNS-01 验证模式
-                bool isWildcard = (wcslen(domainBuf) >= 2 && domainBuf[0] == L'*' && domainBuf[1] == L'.');
-                if (isWildcard) {
-                    if ((int)SendMessageW(g_hVerifyMode, CB_GETCURSEL, 0, 0) != 1) {
-                        SendMessageW(g_hVerifyMode, CB_SETCURSEL, 1, 0);
-                        SyncWebRootVis();
+                // 查找续签记录，按记录联动验证模式和网站目录
+                std::vector<RenewalRecord> records;
+                LoadRenewalRecords(records);
+                std::wstring lookupDomain = domainBuf;
+                int ri = FindRenewalByDomain(records, lookupDomain);
+                if (ri >= 0) {
+                    // 按记录设置验证模式
+                    SendMessageW(g_hVerifyMode, CB_SETCURSEL, records[ri].verifyMode, 0);
+                    SyncWebRootVis();
+                    // 恢复网站目录
+                    if (!records[ri].webRoot.empty()) {
+                        SetWindowTextW(g_hWebRoot, records[ri].webRoot.c_str());
                     }
+                    // 通配符
+                    bool isWild = records[ri].wildcard;
                     if (g_hWildcard) {
-                        SendMessageW(g_hWildcard, BM_SETCHECK, BST_CHECKED, 0);
-                        // 自绘复选框需手动触发重绘
+                        SendMessageW(g_hWildcard, BM_SETCHECK, isWild ? BST_CHECKED : BST_UNCHECKED, 0);
                         InvalidateRect(g_hWildcard, NULL, TRUE);
                         UpdateWindow(g_hWildcard);
                     }
                 } else {
-                    // 非通配符域名 → 取消勾选
-                    if (g_hWildcard) {
-                        SendMessageW(g_hWildcard, BM_SETCHECK, BST_UNCHECKED, 0);
-                        InvalidateRect(g_hWildcard, NULL, TRUE);
-                        UpdateWindow(g_hWildcard);
+                    // 无续签记录，按域名前缀推断
+                    bool isWildcard = (wcslen(domainBuf) >= 2 && domainBuf[0] == L'*' && domainBuf[1] == L'.');
+                    if (isWildcard) {
+                        if ((int)SendMessageW(g_hVerifyMode, CB_GETCURSEL, 0, 0) != 1) {
+                            SendMessageW(g_hVerifyMode, CB_SETCURSEL, 1, 0);
+                            SyncWebRootVis();
+                        }
+                        if (g_hWildcard) {
+                            SendMessageW(g_hWildcard, BM_SETCHECK, BST_CHECKED, 0);
+                            InvalidateRect(g_hWildcard, NULL, TRUE);
+                            UpdateWindow(g_hWildcard);
+                        }
+                    } else {
+                        if (g_hWildcard) {
+                            SendMessageW(g_hWildcard, BM_SETCHECK, BST_UNCHECKED, 0);
+                            InvalidateRect(g_hWildcard, NULL, TRUE);
+                            UpdateWindow(g_hWildcard);
+                        }
                     }
                 }
                 LoadDnsConfigForDomain(domainBuf);
